@@ -3,10 +3,9 @@ import { getLinkStats, type LinkStats as LinkStatsType } from '../lib/api';
 
 interface Props {
   slug: string;
-  onBack: () => void;
 }
 
-export function LinkStats({ slug, onBack }: Props) {
+export function LinkStats({ slug }: Props) {
   const [stats, setStats] = useState<LinkStatsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -25,9 +24,6 @@ export function LinkStats({ slug, onBack }: Props) {
 
   return (
     <div>
-      <button onClick={onBack} style={{ marginBottom: '1rem', padding: '0.5rem', cursor: 'pointer' }}>
-        ← Voltar
-      </button>
       <h2>Estatísticas: {slug}</h2>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
         <div style={{ padding: '1rem', background: '#f8f9fa', borderRadius: '8px' }}>

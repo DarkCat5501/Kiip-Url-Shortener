@@ -8,7 +8,7 @@ export class LinksController {
   constructor(private readonly linksService: LinksService) {}
 
   @Post()
-  @Throttle({ default: { limit: 30, ttl: 60000 } })
+  // @Throttle({ default: { limit: 30, ttl: 60000 } }) // Desabilitado para stress test
   async create(@Body() dto: CreateLinkDto) {
     return this.linksService.create(dto);
   }

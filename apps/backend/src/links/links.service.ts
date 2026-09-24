@@ -1,4 +1,4 @@
-import { Injectable, ConflictException, NotFoundException } from '@nestjs/common';
+import { Injectable, ConflictException, NotFoundException, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { CreateLinkDto } from './dto/create-link.dto.js';
@@ -6,35 +6,109 @@ import { nanoid } from 'nanoid';
 import type { Link } from '@prisma/client';
 
 @Injectable()
-export class LinksService {
+export class LinksService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(LinksService.name);
+  private linkBuffer: Array<{
+    id: string;
+    slug: string;
+    url: string;
+    expiresAt: Date | null;
+    maxClicks: number | null;
+  }> = [];
+  private flushInterval: NodeJS.Timeout | null = null;
+
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
   ) {}
 
+  onModuleInit() {
+    this.flushInterval = setInterval(() => {
+      this.flushLinks().catch((err) => this.logger.error('Failed to flush links', err));
+    }, 5000);
+  }
+
+  onModuleDestroy() {
+    if (this.flushInterval) {
+      clearInterval(this.flushInterval);
+    }
+    this.flushLinks().catch((err) => this.logger.error('Failed to flush links on shutdown', err));
+  }
+
+  private async flushLinks() {
+    if (this.linkBuffer.length === 0) return;
+
+    const links = [...this.linkBuffer];
+    this.linkBuffer = [];
+
+    try {
+      // Batch insert com Prisma createMany
+      await this.prisma.link.createMany({
+        data: links.map((l) => ({
+          id: l.id,
+          slug: l.slug,
+          url: l.url,
+          expiresAt: l.expiresAt,
+          maxClicks: l.maxClicks,
+        })),
+        skipDuplicates: true, // ignora slugs duplicados
+      });
+      this.logger.debug(`Flushed ${links.length} links to database`);
+    } catch (err) {
+      this.logger.error('Failed to write links to database', err);
+      // Re-adiciona ao buffer para retry
+      this.linkBuffer.push(...links);
+    }
+  }
+
   async create(dto: CreateLinkDto): Promise<Link & { shortUrl: string }> {
     const slug = dto.slug || nanoid(7);
 
+    // Verifica unicidade no Redis (mais rápido que banco)
     if (dto.slug) {
+      const cached = await this.redis.get(`link:${dto.slug}`);
+      if (cached) {
+        throw new ConflictException(`Slug '${dto.slug}' already exists`);
+      }
+      // Também verifica no banco para garantir
       const existing = await this.prisma.link.findUnique({ where: { slug: dto.slug } });
       if (existing) {
         throw new ConflictException(`Slug '${dto.slug}' already exists`);
       }
     }
 
-    const link = await this.prisma.link.create({
-      data: {
-        slug,
-        url: dto.url,
-        expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
-        maxClicks: dto.maxClicks ?? null,
-      },
+    const id = crypto.randomUUID();
+    const now = new Date();
+    const linkData: Link = {
+      id,
+      slug,
+      url: dto.url,
+      active: true,
+      expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
+      maxClicks: dto.maxClicks ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Cacheia no Redis imediatamente (redirect funciona)
+    await this.redis.set(`link:${slug}`, linkData, 3600);
+
+    // Adiciona ao buffer para batch insert no banco
+    this.linkBuffer.push({
+      id,
+      slug,
+      url: dto.url,
+      expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
+      maxClicks: dto.maxClicks ?? null,
     });
 
-    await this.redis.set(`link:${slug}`, link, 3600);
+    // Flush imediato se buffer grande
+    if (this.linkBuffer.length >= 100) {
+      this.flushLinks().catch((err) => this.logger.error('Failed to flush links', err));
+    }
 
     return {
-      ...link,
+      ...linkData,
       shortUrl: `${process.env.BASE_URL || 'http://localhost:3000'}/${slug}`,
     };
   }

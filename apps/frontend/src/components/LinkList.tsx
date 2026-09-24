@@ -1,5 +1,6 @@
 import type { Link } from '../lib/api';
 import { deactivateLink } from '../lib/api';
+import { useState } from 'react';
 
 interface Props {
   links: Link[];
@@ -7,7 +8,13 @@ interface Props {
   onDeactivated: (slug: string) => void;
 }
 
+const PAGE_SIZE = 10;
+
 export function LinkList({ links, onSelect, onDeactivated }: Props) {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.ceil(links.length / PAGE_SIZE);
+  const paginatedLinks = links.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
   const handleDeactivate = async (slug: string) => {
     if (!confirm('Desativar este link?')) return;
     try {
@@ -24,7 +31,7 @@ export function LinkList({ links, onSelect, onDeactivated }: Props) {
 
   return (
     <div>
-      <h2>Links</h2>
+      <h2>Links ({links.length})</h2>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr style={{ borderBottom: '2px solid #ccc' }}>
@@ -36,7 +43,7 @@ export function LinkList({ links, onSelect, onDeactivated }: Props) {
           </tr>
         </thead>
         <tbody>
-          {links.map((link) => (
+          {paginatedLinks.map((link) => (
             <tr key={link.id} style={{ borderBottom: '1px solid #eee' }}>
               <td style={{ padding: '0.5rem' }}>
                 <a href={`/${link.slug}`} target="_blank" rel="noopener noreferrer">
@@ -66,6 +73,28 @@ export function LinkList({ links, onSelect, onDeactivated }: Props) {
           ))}
         </tbody>
       </table>
+      
+      {totalPages > 1 && (
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '0.5rem', marginTop: '1rem' }}>
+          <button 
+            onClick={() => setPage(p => Math.max(1, p - 1))} 
+            disabled={page === 1}
+            style={{ padding: '0.5rem 1rem', cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.5 : 1 }}
+          >
+            ← Anterior
+          </button>
+          <span style={{ padding: '0.5rem 1rem', lineHeight: '2rem' }}>
+            Página {page} de {totalPages}
+          </span>
+          <button 
+            onClick={() => setPage(p => Math.min(totalPages, p + 1))} 
+            disabled={page === totalPages}
+            style={{ padding: '0.5rem 1rem', cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.5 : 1 }}
+          >
+            Próxima →
+          </button>
+        </div>
+      )}
     </div>
   );
 }

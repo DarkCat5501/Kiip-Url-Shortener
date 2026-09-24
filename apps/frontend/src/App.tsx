@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { CreateLink } from './components/CreateLink';
 import { LinkList } from './components/LinkList';
 import { LinkStats } from './components/LinkStats';
@@ -6,8 +6,26 @@ import { getLinks, type Link } from './lib/api';
 
 function App() {
   const [links, setLinks] = useState<Link[]>([]);
-  const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+  const [currentSlug, setCurrentSlug] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Parse hash to get slug from /stats/{slug}
+  const getSlugFromHash = useCallback(() => {
+    const hash = window.location.hash.slice(1); // remove #
+    const match = hash.match(/^\/stats\/(.+)$/);
+    return match ? match[1] : null;
+  }, []);
+
+  useEffect(() => {
+    setCurrentSlug(getSlugFromHash());
+
+    const handleHashChange = () => {
+      setCurrentSlug(getSlugFromHash());
+    };
+
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, [getSlugFromHash]);
 
   useEffect(() => {
     loadLinks();
@@ -34,10 +52,14 @@ function App() {
     );
   };
 
-  if (selectedSlug) {
+  const navigateToStats = (slug: string) => {
+    window.location.hash = `#/stats/${slug}`;
+  };
+
+  if (currentSlug) {
     return (
       <div style={{ maxWidth: '900px', margin: '0 auto', padding: '2rem' }}>
-        <LinkStats slug={selectedSlug} onBack={() => setSelectedSlug(null)} />
+        <LinkStats slug={currentSlug} />
       </div>
     );
   }
@@ -46,7 +68,7 @@ function App() {
     <div style={{ maxWidth: '900px', margin: '0 auto', padding: '2rem' }}>
       <h1>KIIP - Encurtador de Links</h1>
       <CreateLink onCreated={handleCreated} />
-      {loading ? <p>Carregando links...</p> : <LinkList links={links} onSelect={setSelectedSlug} onDeactivated={handleDeactivated} />}
+      {loading ? <p>Carregando links...</p> : <LinkList links={links} onSelect={navigateToStats} onDeactivated={handleDeactivated} />}
     </div>
   );
 }
