@@ -81,20 +81,35 @@ export class RedirectService {
       return { url: '', status: RedirectStatus.GONE };
     }
 
+    // Check maxClicks using Redis counter (faster than COUNT query)
     if (link.maxClicks) {
-      const clickCount = await this.prisma.accessLog.count({
-        where: { linkId: link.id },
-      });
-
+      const clickCount = await this.getClickCount(link.id);
       if (clickCount >= link.maxClicks) {
         await this.redis.del(`link:${slug}`);
         return { url: '', status: RedirectStatus.GONE };
       }
     }
 
+    // Log access asynchronously (non-blocking)
     this.logAccessAsync(link.id, res.req.headers.referer, res.req.headers['user-agent'], res.req.ip);
 
+    // Increment click counter in Redis
+    if (link.maxClicks) {
+      await this.incrementClickCount(link.id);
+    }
+
     return { url: link.url, status: RedirectStatus.OK };
+  }
+
+  private async getClickCount(linkId: string): Promise<number> {
+    const count = await this.redis.get<number>(`clicks:${linkId}`);
+    return count ?? 0;
+  }
+
+  private async incrementClickCount(linkId: string): Promise<void> {
+    const key = `clicks:${linkId}`;
+    const count = await this.redis.get<number>(key);
+    await this.redis.set(key, (count ?? 0) + 1, 3600);
   }
 
   private logAccessAsync(linkId: string, referer?: string, userAgent?: string | string[], ip?: string) {
