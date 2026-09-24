@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:19
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kiip
+      POSTGRES_USER: kiip
+      POSTGRES_PASSWORD: kiip_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kiip -d kiip"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://kiip:kiip_secret@postgres:5432/kiip
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PORT: 3000
+      THROTTLE_TTL: 60000
+      THROTTLE_LIMIT: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:3000
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
