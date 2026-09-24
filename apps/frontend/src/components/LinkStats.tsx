@@ -5,6 +5,15 @@ interface Props {
   slug: string;
 }
 
+// Evita shift de timezone: toLocaleDateString converteria para o fuso local
+function formatUtcDate(isoDate: string): string {
+  const d = new Date(isoDate);
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const year = d.getUTCFullYear();
+  return `${day}/${month}/${year}`;
+}
+
 export function LinkStats({ slug }: Props) {
   const [stats, setStats] = useState<LinkStatsType | null>(null);
   const [loading, setLoading] = useState(true);
@@ -48,7 +57,7 @@ export function LinkStats({ slug }: Props) {
           <tbody>
             {stats.dailyStats.map((day) => (
               <tr key={day.date} style={{ borderBottom: '1px solid #eee' }}>
-                <td style={{ padding: '0.5rem' }}>{new Date(day.date).toLocaleDateString('pt-BR')}</td>
+                <td style={{ padding: '0.5rem' }}>{formatUtcDate(day.date)}</td>
                 <td style={{ textAlign: 'right', padding: '0.5rem' }}>{day.count}</td>
               </tr>
             ))}
