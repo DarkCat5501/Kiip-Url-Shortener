@@ -5,11 +5,11 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "bun run --filter '*' dev",
-    "dev:backend": "bun run --filter backend dev",
-    "dev:frontend": "bun run --filter frontend dev",
-    "build": "bun run --filter '*' build",
-    "test": "bun run --filter backend test",
-    "test:e2e": "bun run --filter backend test:e2e"
+    "dev": "concurrently \"cd apps/backend && bun run start:dev\" \"cd apps/frontend && bun run dev\"",
+    "dev:backend": "cd apps/backend && bun run start:dev",
+    "dev:frontend": "cd apps/frontend && bun run dev",
+    "build": "cd apps/backend && bun run build && cd ../frontend && bun run build",
+    "test": "cd apps/backend && bun run test",
+    "test:e2e": "cd apps/backend && bun run test:e2e"
   }
 }
