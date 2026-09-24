@@ -17,6 +17,16 @@ const mockRedis = {
   get: vi.fn(),
   set: vi.fn(),
   del: vi.fn(),
+  delByPattern: vi.fn(),
+  lpush: vi.fn(),
+  llen: vi.fn().mockResolvedValue(0),
+  getCounter: vi.fn().mockResolvedValue(0),
+  getCounters: vi.fn().mockResolvedValue([]),
+};
+
+// Mock ConfigService: retorna sempre o default passado (segundo argumento de get)
+const mockConfig = {
+  get: vi.fn((_key: string, defaultValue?: unknown) => defaultValue),
 };
 
 describe('LinksService', () => {
@@ -24,7 +34,7 @@ describe('LinksService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    service = new LinksService(mockPrisma as any, mockRedis as any);
+    service = new LinksService(mockPrisma as any, mockRedis as any, mockConfig as any);
   });
 
   describe('create', () => {
@@ -89,10 +99,11 @@ describe('LinksService', () => {
         slug: 'abc',
         url: 'https://example.com',
         active: true,
-        _count: { accesses: 42 },
+        clickCount: 40,
       };
 
       mockPrisma.link.findUnique.mockResolvedValue(mockLink);
+      mockRedis.getCounter.mockResolvedValue(2);
 
       const result = await service.findOne('abc');
 

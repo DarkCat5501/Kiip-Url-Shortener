@@ -1,12 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
+import { LinksService, isEffectivelyActive } from '../links/links.service.js';
 
 @Injectable()
 export class StatsService {
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
+    private linksService: LinksService,
   ) {}
 
   async getStats(slug: string) {
@@ -14,31 +16,37 @@ export class StatsService {
     const cached = await this.redis.get<any>(cacheKey);
     if (cached) return cached;
 
-    const link = await this.prisma.link.findUnique({
-      where: { slug },
-    });
+    // findBySlug passa pelo cache L1/L2 antes do banco — necessário porque um
+    // link recém-criado pode ainda estar só no buffer de escrita em lote,
+    // sem ter sido persistido no Postgres (o flush roda a cada 2s ou 20 itens).
+    const link = await this.linksService.findBySlug(slug);
 
     if (!link) {
       throw new NotFoundException(`Link with slug '${slug}' not found`);
     }
 
-    const [totalClicks, dailyStats, recentAccesses] = await Promise.all([
-      this.prisma.accessLog.count({ where: { linkId: link.id } }),
+    const [persistedCount, pendingDelta, dailyStats, recentAccesses] = await Promise.all([
+      this.linksService.getPersistedClickCount(link.id),
+      this.redis.getCounter(`clicks:${link.id}`),
       this.getDailyStats(link.id),
       this.getRecentAccesses(link.id),
     ]);
 
+    const totalClicks = persistedCount + pendingDelta;
+
     const result = {
       slug: link.slug,
       url: link.url,
-      active: link.active,
+      active: isEffectivelyActive(link),
       createdAt: link.createdAt,
       totalClicks,
       dailyStats,
       recentAccesses,
     };
 
-    await this.redis.set(cacheKey, result, 30);
+    // Cache for 5s: protege contra rajadas de leitura no mesmo link sem deixar
+    // a tela de stats visivelmente desatualizada por muito tempo
+    await this.redis.set(cacheKey, result, 5);
 
     return result;
   }

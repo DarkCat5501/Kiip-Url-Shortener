@@ -18,6 +18,6 @@ export class RedirectController {
       throw new GoneException('Link is no longer active');
     }
 
-    return res.redirect(302, result.url);
+    res.redirect(302, result.url);
   }
 }

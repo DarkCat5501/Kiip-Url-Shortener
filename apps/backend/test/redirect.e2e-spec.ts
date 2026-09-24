@@ -8,6 +8,9 @@ import { AppModule } from '../src/app.module.js';
 describe('Redirect Flow (e2e)', () => {
   let app: INestApplication<App>;
   let createdSlug: string;
+  // Slug único por execução (máx. 10 caracteres): evita colisão com dados de
+  // rodadas anteriores (o banco de teste não é limpo entre execuções)
+  const customSlug = `e2e${Date.now().toString(36)}`.slice(0, 10);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -48,10 +51,10 @@ describe('Redirect Flow (e2e)', () => {
     it('should create a link with custom slug', async () => {
       const response = await request(app.getHttpServer())
         .post('/links')
-        .send({ url: 'https://example.com', slug: 'testlink' })
+        .send({ url: 'https://example.com', slug: customSlug })
         .expect(201);
 
-      expect(response.body.slug).toBe('testlink');
+      expect(response.body.slug).toBe(customSlug);
     });
 
     it('should reject invalid URL', async () => {
@@ -64,7 +67,7 @@ describe('Redirect Flow (e2e)', () => {
     it('should reject duplicate slug', async () => {
       await request(app.getHttpServer())
         .post('/links')
-        .send({ url: 'https://example.com', slug: 'testlink' })
+        .send({ url: 'https://example.com', slug: customSlug })
         .expect(409);
     });
   });
@@ -109,6 +112,7 @@ describe('Redirect Flow (e2e)', () => {
     it('should deactivate a link', async () => {
       const response = await request(app.getHttpServer())
         .patch(`/links/${createdSlug}`)
+        .send({ active: false })
         .expect(200);
 
       expect(response.body.active).toBe(false);
