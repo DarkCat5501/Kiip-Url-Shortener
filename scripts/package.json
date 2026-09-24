@@ -1,0 +1,20 @@
+{
+  "name": "kiip-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "bun run setup.ts",
+    "stress": "bun run stress-test.ts",
+    "stress:redirect": "bun run stress-test.ts --redirect",
+    "stress:stats": "bun run stress-test.ts --stats",
+    "stress:all": "bun run stress-test.ts --all",
+    "cleanup": "bun run cleanup.ts",
+    "hit": "bun run hit-slug.ts",
+    "hit-multi": "bun run hit-multi.ts",
+    "hit-with-creates": "bun run hit-with-creates.ts",
+    "deactivate": "bun run test-deactivate.ts"
+  },
+  "dependencies": {
+    "autocannon": "^8.0.0"
+  }
+}
