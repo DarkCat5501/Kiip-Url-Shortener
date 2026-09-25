@@ -1,13 +1,10 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { LinksService } from '../links/links.service.js';
-
-const REDIS_CLICK_ID = (id: string) => `c:${id}`;
-const REDIS_LINK_ID = (id: string) => `l:${id}`;
-const ACCESS_LOG_BUFFER_KEY = 'b:acc_logs';
+import { ACCESS_LOG_BUFFER_KEY, REDIS_LINK_KEY, REDIS_CLICK_COUNT_KEY } from '../_core/constants.js';
 
 export enum RedirectStatus {
   OK = 'ok',
@@ -20,14 +17,14 @@ type RedirectResult = {
 };
 
 type AccessLogEntry = {
-  linkId: string;
+  slug: string;
   referer?: string;
   userAgent?: string;
   ip?: string;
 };
 
 @Injectable()
-export class RedirectService implements OnModuleInit {
+export class RedirectService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RedirectService.name);
   private flushInterval: NodeJS.Timeout | null = null;
   private isFlushing = false;
@@ -43,22 +40,27 @@ export class RedirectService implements OnModuleInit {
     private linksService: LinksService,
     private config: ConfigService,
   ) {
-    // Quantidade de logs no buffer que dispara um flush imediato (além do timer periódico)
     this.accessLogThreshold = this.config.get<number>('ACCESS_LOG_THRESHOLD', 100);
-    // Intervalo do flush periódico do buffer de access logs, em milissegundos
     this.accessLogFlushIntervalMs = this.config.get<number>('ACCESS_LOG_FLUSH_INTERVAL_MS', 5000);
-    // Tamanho máximo de cada lote lido do buffer por vez durante o flush
     this.accessLogFlushBatchSize = this.config.get<number>('ACCESS_LOG_FLUSH_BATCH_SIZE', 1000);
-    // TTL do contador de cliques pendente no Redis (clicks:{linkId}), em segundos
     this.clickCountTtlSeconds = this.config.get<number>('CLICK_COUNT_TTL_SECONDS', 3600);
   }
 
   async onModuleInit() {
     await this.flushLogs();
 
+    // Exige CPU always-allocated no Cloud Run (ver README "Cloud Run"),
+    // senão o timer fica suspenso entre requests.
     this.flushInterval = setInterval(() => {
       this.flushLogs().catch((err) => this.logger.error('Failed to flush logs', err));
     }, this.accessLogFlushIntervalMs);
+  }
+
+  async onModuleDestroy() {
+    if (this.flushInterval) {
+      clearInterval(this.flushInterval);
+    }
+    await this.flushLogs().catch((err) => this.logger.error('Failed final flush on shutdown', err));
   }
 
   private async flushLogs() {
@@ -82,39 +84,62 @@ export class RedirectService implements OnModuleInit {
   }
 
   private async flushBatch(logs: AccessLogEntry[]) {
+    const slugs = Array.from(new Set(logs.map((log) => log.slug)));
+    const links = await this.prisma.link.findMany({
+      where: { slug: { in: slugs } },
+      select: { id: true, slug: true },
+    });
+    const idBySlug = new Map(links.map((l) => [l.slug, l.id]));
+
+    const resolvedLogs = logs
+      .map((log) => {
+        const linkId = idBySlug.get(log.slug);
+        if (linkId === undefined) return null;
+        return { linkId, referer: log.referer, userAgent: log.userAgent, ip: log.ip };
+      })
+      .filter((log): log is NonNullable<typeof log> => log !== null);
+
+    const unresolvedLogs = logs.filter((log) => !idBySlug.has(log.slug));
+
     try {
-      await this.prisma.accessLog.createMany({ data: logs });
+      if (resolvedLogs.length > 0) {
+        await this.prisma.accessLog.createMany({ data: resolvedLogs });
+      }
     } catch (err) {
-      this.logger.warn(`Failed to flush ${logs.length} access logs (will retry)`);
+      this.logger.warn(`Failed to flush ${resolvedLogs.length} access logs (will retry)`);
       await this.redis.lpush(ACCESS_LOG_BUFFER_KEY, logs.map((log) => JSON.stringify(log)));
+      return;
     }
 
-    await this.flushClickCounts(logs.map((log) => log.linkId));
+    if (unresolvedLogs.length > 0) {
+      this.logger.warn(`${unresolvedLogs.length} access logs waiting for their link to persist (will retry)`);
+      await this.redis.lpush(ACCESS_LOG_BUFFER_KEY, unresolvedLogs.map((log) => JSON.stringify(log)));
+    }
+
+    await this.flushClickCounts(logs.map((log) => log.slug));
   }
 
-  private async flushClickCounts(linkIds: string[]) {
-    const deltaByLink = new Map<string, number>();
-    linkIds.forEach((id) => deltaByLink.set(id, (deltaByLink.get(id) ?? 0) + 1))
+  private async flushClickCounts(slugs: string[]) {
+    const deltaBySlug = new Map<string, number>();
+    slugs.forEach((slug) => deltaBySlug.set(slug, (deltaBySlug.get(slug) ?? 0) + 1));
 
-    const entries = Array.from(deltaByLink.entries());
+    const entries = Array.from(deltaBySlug.entries());
 
     try {
-      // Um único UPDATE para todos os links do batch
       await this.prisma.$executeRaw`
         UPDATE "links" AS l
         SET "click_count" = l."click_count" + d.delta
         FROM (
           SELECT * FROM UNNEST(
-            ${entries.map(([id]) => id)}::uuid[],
+            ${entries.map(([slug]) => slug)}::text[],
             ${entries.map(([, delta]) => delta)}::int[]
-          ) AS t(id, delta)
+          ) AS t(slug, delta)
         ) AS d
-        WHERE l."id" = d.id
+        WHERE l."slug" = d.slug
       `;
 
-      // Deltas já persistidos: remove do baseline pendente para não contar em dobro
-      for (const [linkId, delta] of entries) {
-        await this.redis.incrby(REDIS_CLICK_ID(linkId), -delta);
+      for (const [slug, delta] of entries) {
+        await this.redis.incrby(REDIS_CLICK_COUNT_KEY(slug), -delta);
       }
     } catch (err) {
       this.logger.warn(`Failed to sync click counts for ${entries.length} links (will retry)`);
@@ -136,52 +161,49 @@ export class RedirectService implements OnModuleInit {
     }
 
     if (link.expiresAt && new Date(link.expiresAt) < new Date()) {
-      this.redis.del(REDIS_LINK_ID(slug)).catch(() => { });
+      this.redis.del(REDIS_LINK_KEY(slug)).catch(() => { });
       this.deactivateInBackground(slug);
       return { url: '', status: RedirectStatus.GONE };
     }
 
     if (link.maxClicks) {
       const [persistedCount, pendingDelta] = await Promise.all([
-        this.linksService.getPersistedClickCount(link.id),
-        this.redis.getCounter(REDIS_CLICK_ID(link.id)),
+        this.linksService.getPersistedClickCount(slug),
+        this.redis.getCounter(REDIS_CLICK_COUNT_KEY(slug)),
       ]);
       const clickCount = persistedCount + pendingDelta;
       if (clickCount > link.maxClicks) {
-        this.redis.del(REDIS_LINK_ID(slug)).catch(() => { });
+        this.redis.del(REDIS_LINK_KEY(slug)).catch(() => { });
         this.deactivateInBackground(slug);
         return { url: '', status: RedirectStatus.GONE };
       }
     }
 
-    this.recordAccessInBackground(link.id, res.req.headers.referer, res.req.headers['user-agent'], res.req.ip);
+    this.recordAccessInBackground(slug, res.req.headers.referer, res.req.headers['user-agent'], res.req.ip);
 
     return { url: link.url, status: RedirectStatus.OK };
   }
 
   private recordAccessInBackground(
-    linkId: string,
+    slug: string,
     referer?: string,
     userAgent?: string | string[],
     ip?: string,
   ): void {
     Promise.all([
-      this.logAccessAsync(linkId, referer, userAgent, ip),
-      this.incrementClickCount(linkId),
-    ]).catch((err) => this.logger.warn(`Failed to record access for link ${linkId}`, err));
+      this.logAccessAsync(slug, referer, userAgent, ip),
+      this.incrementClickCount(slug),
+    ]).catch((err) => this.logger.warn(`Failed to record access for link '${slug}'`, err));
   }
 
-  // Persiste active=false assim que expiração/esgotamento é detectado, para que
-  // `active` no banco seja sempre a fonte de verdade (sem cálculo derivado)
   private deactivateInBackground(slug: string): void {
     this.prisma.link
       .update({ where: { slug }, data: { active: false } })
       .catch((err) => this.logger.warn(`Failed to persist deactivation for '${slug}' (will retry on next hit)`));
   }
 
-  private async incrementClickCount(linkId: string): Promise<void> {
-    const key = REDIS_CLICK_ID(linkId);
-    // incrby e expire são independentes entre si — não há motivo para serializar
+  private async incrementClickCount(slug: string): Promise<void> {
+    const key = REDIS_CLICK_COUNT_KEY(slug);
     await Promise.all([
       this.redis.incrby(key, 1),
       this.redis.expire(key, this.clickCountTtlSeconds)
@@ -189,13 +211,13 @@ export class RedirectService implements OnModuleInit {
   }
 
   private async logAccessAsync(
-    linkId: string,
+    slug: string,
     referer?: string,
     userAgent?: string | string[],
     ip?: string,
   ) {
     const log: AccessLogEntry = {
-      linkId,
+      slug,
       referer: referer || undefined,
       userAgent: Array.isArray(userAgent) ? userAgent[0] : userAgent,
       ip,

@@ -41,7 +41,7 @@ describe('LinksService', () => {
     it('should create a link with auto-generated slug', async () => {
       const dto = { url: 'https://example.com' };
       const mockLink = {
-        id: '123',
+        id: 123n,
         slug: 'abc1234',
         url: 'https://example.com',
         active: true,
@@ -65,7 +65,7 @@ describe('LinksService', () => {
     it('should create a link with custom slug', async () => {
       const dto = { url: 'https://example.com', slug: 'custom' };
       const mockLink = {
-        id: '123',
+        id: 123n,
         slug: 'custom',
         url: 'https://example.com',
         active: true,
@@ -86,7 +86,7 @@ describe('LinksService', () => {
     it('should throw ConflictException if custom slug already exists', async () => {
       const dto = { url: 'https://example.com', slug: 'taken' };
 
-      mockPrisma.link.findUnique.mockResolvedValue({ id: 'existing' });
+      mockPrisma.link.findUnique.mockResolvedValue({ id: 999n });
 
       await expect(service.create(dto)).rejects.toThrow(ConflictException);
     });
@@ -95,7 +95,7 @@ describe('LinksService', () => {
   describe('findOne', () => {
     it('should return a link with click count', async () => {
       const mockLink = {
-        id: '123',
+        id: 123n,
         slug: 'abc',
         url: 'https://example.com',
         active: true,
@@ -120,7 +120,7 @@ describe('LinksService', () => {
 
   describe('deactivate', () => {
     it('should deactivate a link and clear cache', async () => {
-      const mockLink = { id: '123', slug: 'abc' };
+      const mockLink = { id: 123n, slug: 'abc' };
       const mockUpdated = { ...mockLink, active: false };
 
       mockPrisma.link.findUnique.mockResolvedValue(mockLink);
@@ -129,7 +129,7 @@ describe('LinksService', () => {
       const result = await service.deactivate('abc');
 
       expect(result.active).toBe(false);
-      expect(mockRedis.del).toHaveBeenCalledWith('link:abc');
+      expect(mockRedis.del).toHaveBeenCalledWith('l:abc');
     });
 
     it('should throw NotFoundException if link not found', async () => {
@@ -141,7 +141,7 @@ describe('LinksService', () => {
 
   describe('findBySlug', () => {
     it('should return cached link if available', async () => {
-      const cachedLink = { id: '123', slug: 'abc', url: 'https://example.com' };
+      const cachedLink = { id: 123n, slug: 'abc', url: 'https://example.com' };
 
       mockRedis.get.mockResolvedValue(cachedLink);
 
@@ -151,16 +151,17 @@ describe('LinksService', () => {
       expect(mockPrisma.link.findUnique).not.toHaveBeenCalled();
     });
 
-    it('should fetch from database and cache if not in cache', async () => {
-      const dbLink = { id: '123', slug: 'abc', url: 'https://example.com' };
+    it('should fetch from database and cache if not in cache (without id)', async () => {
+      const dbLink = { id: 123n, slug: 'abc', url: 'https://example.com' };
+      const withoutId = { slug: 'abc', url: 'https://example.com' };
 
       mockRedis.get.mockResolvedValue(null);
       mockPrisma.link.findUnique.mockResolvedValue(dbLink);
 
       const result = await service.findBySlug('abc');
 
-      expect(result).toEqual(dbLink);
-      expect(mockRedis.set).toHaveBeenCalledWith('link:abc', dbLink, 3600);
+      expect(result).toEqual(withoutId);
+      expect(mockRedis.set).toHaveBeenCalledWith('l:abc', withoutId, 3600);
     });
 
     it('should return null if link not found anywhere', async () => {

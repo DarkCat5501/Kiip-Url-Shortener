@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { LinksService, isEffectivelyActive } from '../links/links.service.js';
+import { REDIS_CLICK_COUNT_KEY } from '../_core/constants.js';
 
 @Injectable()
 export class StatsService {
@@ -25,11 +26,15 @@ export class StatsService {
       throw new NotFoundException(`Link with slug '${slug}' not found`);
     }
 
+    // Resolve o id real do banco: o cache do link pode não ter id se ele
+    // ainda não foi persistido pelo flush do buffer de criação.
+    const linkId = await this.linksService.getPersistedId(slug);
+
     const [persistedCount, pendingDelta, dailyStats, recentAccesses] = await Promise.all([
-      this.linksService.getPersistedClickCount(link.id),
-      this.redis.getCounter(`clicks:${link.id}`),
-      this.getDailyStats(link.id),
-      this.getRecentAccesses(link.id),
+      this.linksService.getPersistedClickCount(slug),
+      this.redis.getCounter(REDIS_CLICK_COUNT_KEY(slug)),
+      linkId !== null ? this.getDailyStats(linkId) : Promise.resolve([]),
+      linkId !== null ? this.getRecentAccesses(linkId) : Promise.resolve([]),
     ]);
 
     const totalClicks = persistedCount + pendingDelta;
@@ -51,7 +56,7 @@ export class StatsService {
     return result;
   }
 
-  private async getDailyStats(linkId: string) {
+  private async getDailyStats(linkId: bigint) {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
@@ -62,7 +67,7 @@ export class StatsService {
         DATE("accessed_at") as date,
         COUNT(*) as count
       FROM "access_logs"
-      WHERE "link_id" = ${linkId}::uuid
+      WHERE "link_id" = ${linkId}
         AND "accessed_at" >= ${sevenDaysAgo}
       GROUP BY DATE("accessed_at")
       ORDER BY date DESC
@@ -74,7 +79,7 @@ export class StatsService {
     }));
   }
 
-  private async getRecentAccesses(linkId: string) {
+  private async getRecentAccesses(linkId: bigint) {
     return this.prisma.accessLog.findMany({
       where: { linkId },
       orderBy: { accessedAt: 'desc' },

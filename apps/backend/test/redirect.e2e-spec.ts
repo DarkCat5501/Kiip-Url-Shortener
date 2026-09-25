@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication, ValidationPipe, ClassSerializerInterceptor } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module.js';
@@ -25,6 +26,12 @@ describe('Redirect Flow (e2e)', () => {
         transform: true,
       }),
     );
+    app.useGlobalInterceptors(
+      new ClassSerializerInterceptor(app.get(Reflector), {
+        excludeExtraneousValues: true,
+        exposeUnsetFields: false,
+      }),
+    );
     await app.init();
   });
 
@@ -39,7 +46,6 @@ describe('Redirect Flow (e2e)', () => {
         .send({ url: 'https://example.com' })
         .expect(201);
 
-      expect(response.body).toHaveProperty('id');
       expect(response.body).toHaveProperty('slug');
       expect(response.body).toHaveProperty('shortUrl');
       expect(response.body.url).toBe('https://example.com');

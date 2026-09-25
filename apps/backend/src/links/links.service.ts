@@ -4,49 +4,38 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { CreateLinkDto } from './dto/create-link.dto.js';
 import { QueryLinksDto, LinkSortField } from './dto/query-links.dto.js';
+import { LinkResponseDto } from './dto/link-response.dto.js';
+import { LINK_BUFFER_KEY, REDIS_LINK_KEY, REDIS_LINK_DETAIL_KEY, REDIS_CLICK_COUNT_KEY, LINKS_LIST_CACHE_PREFIX } from '../_core/constants.js';
 import { nanoid } from 'nanoid';
 import type { Link, Prisma } from '@prisma/client';
 
-const LINK_BUFFER_KEY = 'buffer:links';
-
+type CachedLink = Omit<Link, 'id'>;
 type BufferedLink = {
-  id: string;
   slug: string;
   url: string;
   expiresAt: string | null;
   maxClicks: number | null;
 };
 
-// `active` no banco é a fonte de verdade: o redirect persiste active=false
-// assim que detecta expiração ou esgotamento de maxClicks num acesso real.
-// A única janela residual é um link expirado por data que nunca mais foi
-// acessado desde então — expiresAt é barato de checar (timestamp), então
-// cobrimos esse caso aqui sem depender de nenhum clique disparar a detecção.
+function stripId<T extends { id: unknown }>(obj: T): Omit<T, 'id'> {
+  const { id, ...rest } = obj;
+  return rest;
+}
+
 export function isEffectivelyActive(link: { active: boolean; expiresAt: Date | null }): boolean {
   if (!link.active) return false;
   if (link.expiresAt && new Date(link.expiresAt) < new Date()) return false;
   return true;
 }
 
-function omitNullFields<T extends object>(obj: T): Partial<T> {
-  return Object.fromEntries(
-    Object.entries(obj).filter(([, value]) => value !== null),
-  ) as Partial<T>;
-}
-
 @Injectable()
 export class LinksService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(LinksService.name);
   private flushInterval: NodeJS.Timeout | null = null;
-  private isFlushing = false;
-  // Cache L1 em memória do processo — comparação experimental contra o cache
-  // Redis (L2) para isolar se a latência sob carga vem do roundtrip de rede
-  // ao Redis ou de outra fonte (ex: saturação do event loop).
-  // Nota: expiração/esgotamento detectados no RedirectService não invalidam
-  // essa camada explicitamente — o TTL curto já limita a janela de
-  // inconsistência, e esses eventos são raros comparados ao volume de
-  // redirects normais, então não vale o acoplamento extra entre os services.
-  private localCache = new Map<string, { link: Link; expiresAt: number }>();
+  // null quando ocioso; permite chamadores concorrentes aguardarem o flush em
+  // curso em vez de desistir (ver ensureFlushed).
+  private flushInFlight: Promise<void> | null = null;
+  private localCache = new Map<string, { link: CachedLink; expiresAt: number }>();
 
   private readonly linkBufferThreshold: number;
   private readonly linkFlushIntervalMs: number;
@@ -58,76 +47,85 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
     private redis: RedisService,
     private config: ConfigService,
   ) {
-    // Quantidade de links no buffer que dispara um flush imediato (além do timer periódico)
     this.linkBufferThreshold = this.config.get<number>('LINK_BUFFER_THRESHOLD', 20);
-    // Intervalo do flush periódico do buffer de links, em milissegundos
     this.linkFlushIntervalMs = this.config.get<number>('LINK_FLUSH_INTERVAL_MS', 2000);
-    // TTL do cache L1 em memória: curto o bastante para não deixar o cache
-    // desatualizado por muito tempo em relação a desativações feitas por outra instância
+    // TTL curto: limita por quanto tempo o cache L1 fica desatualizado em
+    // relação a uma desativação feita por outra instância.
     this.localCacheTtlMs = this.config.get<number>('LOCAL_CACHE_TTL_MS', 2000);
-    // Limita a memória do processo: só os slugs mais acessados recentemente
-    // ficam em cache local (LRU), o resto sempre passa pelo Redis
     this.localCacheMaxSize = this.config.get<number>('LOCAL_CACHE_MAX_SIZE', 1000);
   }
 
   async onModuleInit() {
     await this.flushLinks();
 
+    // Exige CPU always-allocated no Cloud Run (ver README "Cloud Run"),
+    // senão o timer fica suspenso entre requests.
     this.flushInterval = setInterval(() => {
       this.flushLinks().catch((err) => this.logger.error('Failed to flush links', err));
     }, this.linkFlushIntervalMs);
   }
 
-  onModuleDestroy() {
+  async onModuleDestroy() {
     if (this.flushInterval) {
       clearInterval(this.flushInterval);
     }
+    await this.flushLinks().catch((err) => this.logger.error('Failed final flush on shutdown', err));
   }
 
-  private async flushLinks() {
-    // Evita flushes concorrentes disparados simultaneamente pelo timer e pelo threshold
-    if (this.isFlushing) return;
-    this.isFlushing = true;
+  // Aguarda o flush em andamento (se houver) e garante que um flush novo
+  // rodou — usado pelo retry de updateWithFlushRetry, onde "se já está
+  // flushando, desiste" deixaria o link sem persistir.
+  private async ensureFlushed(): Promise<void> {
+    if (this.flushInFlight) {
+      await this.flushInFlight;
+    }
+    await this.flushLinks();
+  }
+
+  private async flushLinks(): Promise<void> {
+    if (this.flushInFlight) {
+      return this.flushInFlight;
+    }
+
+    this.flushInFlight = this.doFlushLinks().finally(() => {
+      this.flushInFlight = null;
+    });
+
+    return this.flushInFlight;
+  }
+
+  private async doFlushLinks(): Promise<void> {
+    const links = await this.redis.lpopall<BufferedLink>(LINK_BUFFER_KEY, 1000);
+
+    if (links.length === 0) return;
 
     try {
-      const links = await this.redis.lpopall<BufferedLink>(LINK_BUFFER_KEY, 1000);
-
-      if (links.length === 0) return;
-
-      try {
-        await this.prisma.link.createMany({
-          data: links.map((l) => ({
-            id: l.id,
-            slug: l.slug,
-            url: l.url,
-            expiresAt: l.expiresAt ? new Date(l.expiresAt) : null,
-            maxClicks: l.maxClicks,
-          })),
-        });
-      } catch (err) {
-        // Silently ignore - data is in Redis, will retry on next flush
-        this.logger.warn(`Failed to flush ${links.length} links (will retry)`);
-        await this.redis.lpush(LINK_BUFFER_KEY, links.map((link) => JSON.stringify(link)));
-      }
-    } finally {
-      this.isFlushing = false;
+      await this.prisma.link.createMany({
+        data: links.map((l) => ({
+          slug: l.slug,
+          url: l.url,
+          expiresAt: l.expiresAt ? new Date(l.expiresAt) : null,
+          maxClicks: l.maxClicks,
+        })),
+      });
+    } catch (err) {
+      this.logger.warn(`Failed to flush ${links.length} links (will retry)`);
+      await this.redis.lpush(LINK_BUFFER_KEY, links.map((link) => JSON.stringify(link)));
     }
   }
 
-  async create(dto: CreateLinkDto): Promise<Link & { shortUrl: string }> {
+  async create(dto: CreateLinkDto): Promise<LinkResponseDto> {
     const slug = dto.slug || nanoid(7);
 
     if (dto.slug) {
-      const cached = await this.redis.get(`link:${dto.slug}`);
+      const cached = await this.redis.get(REDIS_LINK_KEY(dto.slug));
       if (cached) throw new ConflictException(`Slug '${dto.slug}' is not available`);
       const existing = await this.prisma.link.findUnique({ where: { slug: dto.slug } });
       if (existing) throw new ConflictException(`Slug '${dto.slug}' is not available`);
     }
 
-    const id = crypto.randomUUID();
     const now = new Date();
-    const linkData: Link = {
-      id,
+    const linkData: CachedLink = {
       slug,
       url: dto.url,
       active: true,
@@ -138,11 +136,10 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
       updatedAt: now,
     };
 
-    await this.redis.set(`link:${slug}`, linkData, 3600);
-    await this.redis.delByPattern('links:list:*');
+    await this.redis.set(REDIS_LINK_KEY(slug), linkData, 3600);
+    await this.redis.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
 
     const bufferedLink: BufferedLink = {
-      id,
       slug,
       url: dto.url,
       expiresAt: dto.expiresAt || null,
@@ -155,19 +152,20 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
       this.flushLinks().catch((err) => this.logger.error('Failed to flush links', err));
     }
 
-    return {
+    return new LinkResponseDto({
       ...linkData,
       shortUrl: `${process.env.BASE_URL || 'http://localhost:3000'}/${slug}`,
-    };
+    });
   }
 
   async findAll(query: QueryLinksDto) {
     const { page, pageSize, q, sortField, sortOrder } = query;
 
-    // Chave de cache inclui todos os parâmetros para não misturar resultados
-    const cacheKey = `links:list:${page}:${pageSize}:${q ?? ''}:${sortField}:${sortOrder}`;
+    const cacheKey = `${LINKS_LIST_CACHE_PREFIX}${page}:${pageSize}:${q ?? ''}:${sortField}:${sortOrder}`;
     const cached = await this.redis.get<any>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return { ...cached, items: cached.items.map((item: any) => new LinkResponseDto(item)) };
+    }
 
     const where: Prisma.LinkWhereInput = q
       ? { slug: { contains: q, mode: 'insensitive' } }
@@ -191,12 +189,11 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
       this.prisma.link.count({ where }),
     ]);
 
-    // Um único roundtrip ao Redis para todos os deltas pendentes, em vez de um por link
-    const pendingDeltas = await this.redis.getCounters(links.map((l) => `clicks:${l.id}`));
+    const pendingDeltas = await this.redis.getCounters(links.map((l) => REDIS_CLICK_COUNT_KEY(l.slug)));
 
     const items = links.map((link, i) =>
-      omitNullFields({
-        ...link,
+      ({
+        ...stripId(link),
         clickCount: link.clickCount + pendingDeltas[i],
         active: isEffectivelyActive(link),
       }),
@@ -212,13 +209,13 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
 
     await this.redis.set(cacheKey, result, 15);
 
-    return result;
+    return { ...result, items: items.map((item) => new LinkResponseDto(item)) };
   }
 
   async findOne(slug: string) {
-    const cacheKey = `link:${slug}:detail`;
+    const cacheKey = REDIS_LINK_DETAIL_KEY(slug);
     const cached = await this.redis.get<any>(cacheKey);
-    if (cached) return cached;
+    if (cached) return new LinkResponseDto(cached);
 
     const link = await this.prisma.link.findUnique({ where: { slug } });
 
@@ -226,19 +223,19 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
       throw new NotFoundException(`Link with slug '${slug}' not found`);
     }
 
-    const pendingDelta = await this.redis.getCounter(`clicks:${link.id}`);
+    const pendingDelta = await this.redis.getCounter(REDIS_CLICK_COUNT_KEY(link.slug));
     const result = {
-      ...link,
+      ...stripId(link),
       clickCount: link.clickCount + pendingDelta,
       active: isEffectivelyActive(link),
     };
 
     await this.redis.set(cacheKey, result, 30);
 
-    return result;
+    return new LinkResponseDto(result);
   }
 
-  async deactivate(slug: string): Promise<Link> {
+  async deactivate(slug: string): Promise<LinkResponseDto> {
     const link = await this.findBySlug(slug);
 
     if (!link) {
@@ -247,15 +244,15 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
 
     const updated = await this.updateWithFlushRetry(slug, { active: false });
 
-    await this.redis.del(`link:${slug}`);
-    await this.redis.delByPattern('links:list:*');
-    await this.redis.del(`link:${slug}:detail`);
+    await this.redis.del(REDIS_LINK_KEY(slug));
+    await this.redis.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await this.redis.del(REDIS_LINK_DETAIL_KEY(slug));
     this.localCache.delete(slug);
 
-    return updated;
+    return new LinkResponseDto(updated);
   }
 
-  async reactivate(slug: string): Promise<Link> {
+  async reactivate(slug: string): Promise<LinkResponseDto> {
     const link = await this.findBySlug(slug);
 
     if (!link) {
@@ -263,7 +260,7 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (link.maxClicks) {
-      const pendingDelta = await this.redis.getCounter(`clicks:${link.id}`);
+      const pendingDelta = await this.redis.getCounter(REDIS_CLICK_COUNT_KEY(slug));
       const clickCount = link.clickCount + pendingDelta;
       if (clickCount > link.maxClicks) {
         throw new UnprocessableEntityException(
@@ -274,32 +271,48 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
 
     const updated = await this.updateWithFlushRetry(slug, { active: true });
 
-    await this.redis.set(`link:${slug}`, updated, 3600);
-    await this.redis.delByPattern('links:list:*');
-    await this.redis.del(`link:${slug}:detail`);
+    await this.redis.set(REDIS_LINK_KEY(slug), stripId(updated), 3600);
+    await this.redis.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await this.redis.del(REDIS_LINK_DETAIL_KEY(slug));
     this.localCache.delete(slug);
 
-    return updated;
+    return new LinkResponseDto(updated);
   }
 
-  // P2025: link ainda só existe no buffer, não no Postgres — força flush e retenta
+  // create() não é atômico: entre o cache ser populado e o lpush no buffer,
+  // uma requisição concorrente pode achar o link via findBySlug (cache) mas
+  // ainda não no buffer nem no Postgres. Sem isso, o update dispararia P2025.
+  private static readonly MAX_UPDATE_RETRY_ATTEMPTS = 3;
+  private static readonly UPDATE_RETRY_DELAY_MS = 50;
+
   private async updateWithFlushRetry(slug: string, data: Prisma.LinkUpdateInput): Promise<Link> {
-    try {
-      return await this.prisma.link.update({ where: { slug }, data });
-    } catch (err) {
-      if ((err as { code?: string }).code === 'P2025') {
-        await this.flushLinks();
-        return this.prisma.link.update({ where: { slug }, data });
-      }
-      throw err;
+    const exists = await this.prisma.link.findUnique({ where: { slug }, select: { slug: true } });
+    if (!exists) {
+      await this.ensureFlushed();
     }
+
+    for (let attempt = 1; attempt <= LinksService.MAX_UPDATE_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return await this.prisma.link.update({ where: { slug }, data });
+      } catch (err) {
+        const isLastAttempt = attempt === LinksService.MAX_UPDATE_RETRY_ATTEMPTS;
+        if ((err as { code?: string }).code !== 'P2025' || isLastAttempt) {
+          throw err;
+        }
+        if (attempt > 1) {
+          await new Promise((resolve) => setTimeout(resolve, LinksService.UPDATE_RETRY_DELAY_MS));
+        }
+        await this.ensureFlushed();
+      }
+    }
+    throw new NotFoundException(`Link with slug '${slug}' not found`);
   }
 
-  async findBySlug(slug: string): Promise<Link | null> {
+  async findBySlug(slug: string): Promise<CachedLink | null> {
     const localHit = this.getFromLocalCache(slug);
     if (localHit) return localHit;
 
-    const cached = await this.redis.get<Link>(`link:${slug}`);
+    const cached = await this.redis.get<CachedLink>(REDIS_LINK_KEY(slug));
     if (cached) {
       this.setLocalCache(slug, cached);
       return cached;
@@ -307,14 +320,16 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
 
     const link = await this.prisma.link.findUnique({ where: { slug } });
     if (link) {
-      await this.redis.set(`link:${slug}`, link, 3600);
-      this.setLocalCache(slug, link);
+      const withoutId = stripId(link);
+      await this.redis.set(REDIS_LINK_KEY(slug), withoutId, 3600);
+      this.setLocalCache(slug, withoutId);
+      return withoutId;
     }
 
-    return link;
+    return null;
   }
 
-  private getFromLocalCache(slug: string): Link | null {
+  private getFromLocalCache(slug: string): CachedLink | null {
     const entry = this.localCache.get(slug);
     if (!entry) return null;
 
@@ -328,22 +343,30 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
     return entry.link;
   }
 
-  private setLocalCache(slug: string, link: Link): void {
+  private setLocalCache(slug: string, link: CachedLink): void {
     if (this.localCache.size >= this.localCacheMaxSize && !this.localCache.has(slug)) {
-      // Remove o item menos recentemente usado (primeira chave inserida no Map)
       const oldestKey = this.localCache.keys().next().value;
       if (oldestKey !== undefined) this.localCache.delete(oldestKey);
     }
     this.localCache.set(slug, { link, expiresAt: Date.now() + this.localCacheTtlMs });
   }
 
-  // Lê clickCount direto do banco, sem passar pelo cache do link (que guarda
-  // um snapshot que não é refrescado pelos flushes periódicos de clique).
-  async getPersistedClickCount(linkId: string): Promise<number> {
+  // Ignora o cache do link: seu snapshot de clickCount não é refrescado
+  // pelos flushes periódicos de clique.
+  async getPersistedClickCount(slug: string): Promise<number> {
     const link = await this.prisma.link.findUnique({
-      where: { id: linkId },
+      where: { slug },
       select: { clickCount: true },
     });
     return link?.clickCount ?? 0;
+  }
+
+  // Ignora o cache do link: ele nunca tem id (ver stripId).
+  async getPersistedId(slug: string): Promise<bigint | null> {
+    const link = await this.prisma.link.findUnique({
+      where: { slug },
+      select: { id: true },
+    });
+    return link?.id ?? null;
   }
 }
