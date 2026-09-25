@@ -4,7 +4,7 @@ import type { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { LinksService } from '../links/links.service.js';
-import { ACCESS_LOG_BUFFER_KEY, REDIS_LINK_KEY, REDIS_CLICK_COUNT_KEY } from '../_core/constants.js';
+import { ACCESS_LOG_BUFFER_KEY, REDIS_CLICK_COUNT_KEY } from '../_core/constants.js';
 
 export enum RedirectStatus {
   OK = 'ok',
@@ -161,7 +161,7 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (link.expiresAt && new Date(link.expiresAt) < new Date()) {
-      this.redis.del(REDIS_LINK_KEY(slug)).catch(() => { });
+      this.linksService.invalidate(slug).catch(() => { });
       this.deactivateInBackground(slug);
       return { url: '', status: RedirectStatus.GONE };
     }
@@ -173,7 +173,7 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
       ]);
       const clickCount = persistedCount + pendingDelta;
       if (clickCount > link.maxClicks) {
-        this.redis.del(REDIS_LINK_KEY(slug)).catch(() => { });
+        this.linksService.invalidate(slug).catch(() => { });
         this.deactivateInBackground(slug);
         return { url: '', status: RedirectStatus.GONE };
       }

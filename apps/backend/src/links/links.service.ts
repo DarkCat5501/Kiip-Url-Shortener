@@ -244,10 +244,7 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
 
     const updated = await this.updateWithFlushRetry(slug, { active: false });
 
-    await this.redis.del(REDIS_LINK_KEY(slug));
-    await this.redis.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
-    await this.redis.del(REDIS_LINK_DETAIL_KEY(slug));
-    this.localCache.delete(slug);
+    await this.invalidate(slug);
 
     return new LinkResponseDto(updated);
   }
@@ -277,6 +274,14 @@ export class LinksService implements OnModuleInit, OnModuleDestroy {
     this.localCache.delete(slug);
 
     return new LinkResponseDto(updated);
+  }
+
+  // Invalida L1 e L2 de um slug; público para outros services (ex: RedirectService) usarem.
+  async invalidate(slug: string): Promise<void> {
+    await this.redis.del(REDIS_LINK_KEY(slug));
+    await this.redis.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await this.redis.del(REDIS_LINK_DETAIL_KEY(slug));
+    this.localCache.delete(slug);
   }
 
   // create() não é atômico: entre o cache ser populado e o lpush no buffer,
