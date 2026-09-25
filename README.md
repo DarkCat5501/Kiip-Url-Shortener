@@ -13,7 +13,7 @@ Desafio técnico para a vaga de Desenvolvedor(a) Fullstack na Kiip.
 
 ```bash
 # Clone o repositório
-git clone <url-do-repo>
+git clone https://github.com/DarkCat5501/Kiip-Url-Shortener.git
 cd kiip
 
 # Suba tudo
