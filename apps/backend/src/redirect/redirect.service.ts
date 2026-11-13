@@ -41,7 +41,8 @@ export namespace RedirectService {
   const redisPushMaxBatch = getNumber('ACCESS_REDIS_PUSH_MAX_BATCH', 500);
 
   export async function init() {
-    await flushLogs();
+    // Em background: o backlog herdado do Redis pode ser grande e não deve atrasar o boot.
+    flushLogs().catch((err) => logger.error('Failed to flush logs', err));
 
     // Exige CPU always-allocated no Cloud Run (ver README "Cloud Run"),
     // senão o timer fica suspenso entre requests.

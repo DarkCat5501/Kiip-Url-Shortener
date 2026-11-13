@@ -29,10 +29,13 @@ const connectionsIdx = args.indexOf('--connections');
 const duration = durationIdx !== -1 ? parseInt(args[durationIdx + 1]) : 10;
 const connections = connectionsIdx !== -1 ? parseInt(args[connectionsIdx + 1]) : 200;
 
+// Threads do gerador: com uma só, o autocannon satura em ~35k req/s antes do backend
+const workers = parseInt(process.env.STRESS_WORKERS || '4');
+
 const url = `${API}/${slug}`;
 
 console.log(`Stress test: GET ${url}`);
-console.log(`Duração: ${duration}s | Conexões: ${connections}`);
+console.log(`Duração: ${duration}s | Conexões: ${connections} | Threads do gerador: ${workers}`);
 console.log('');
 
 // Verificar se a API está acessível
@@ -54,6 +57,7 @@ const instance = autocannon({
   url,
   connections,
   duration,
+  workers,
   // HTTP pipelining (múltiplas requisições em voo na mesma conexão sem
   // aguardar resposta) infla artificialmente a latência medida — não reflete
   // como clientes HTTP reais se comportam (browsers não fazem pipelining).

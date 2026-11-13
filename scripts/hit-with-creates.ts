@@ -15,6 +15,8 @@ const API_URL = process.env.API_URL || 'http://localhost:3000';
 const TARGET_SLUG = process.argv[2] || 'MxCMMF6';
 const DURATION = parseInt(process.argv[3] || '10');
 const CREATE_RATE = parseInt(process.argv[4] || '500'); // links por segundo
+const CONNECTIONS = parseInt(process.env.STRESS_CONNECTIONS || '400');
+const WORKERS = parseInt(process.env.STRESS_WORKERS || '4');
 
 interface CreateResult {
   slug: string;
@@ -27,6 +29,7 @@ console.log(`  API: ${API_URL}`);
 console.log(`  Slug alvo: ${TARGET_SLUG}`);
 console.log(`  Duração: ${DURATION}s`);
 console.log(`  Taxa de criação: ${CREATE_RATE} links/s`);
+console.log(`  Conexões: ${CONNECTIONS} | Threads do gerador: ${WORKERS}`);
 console.log();
 
 // Verificar se API está disponível
@@ -107,7 +110,10 @@ console.log();
 const instance = autocannon({
   url: `${API_URL}/${TARGET_SLUG}`,
   duration: DURATION,
-  connections: 50,
+  connections: CONNECTIONS,
+  // Threads do gerador: com uma só, o autocannon satura em ~35k req/s e o
+  // backend (vários workers) nunca chega ao limite
+  workers: WORKERS,
   // HTTP pipelining infla artificialmente a latência medida (não reflete
   // clientes HTTP reais)
   pipelining: 1,

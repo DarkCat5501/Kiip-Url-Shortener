@@ -57,7 +57,7 @@ export namespace LinksService {
   const persistedCountCache = new Map<string, { count: number; expiresAt: number }>();
 
   export async function init() {
-    await flushLinks();
+    flushLinks().catch((err) => logger.error('Failed to flush links', err));
 
     // Exige CPU always-allocated no Cloud Run (ver README "Cloud Run"),
     // senão o timer fica suspenso entre requests.

@@ -1,10 +1,13 @@
-# Orçamento total: 4 vCPU / ~3,7 GB (limites por serviço em deploy.resources).
+# Orçamento total: 4 vCPU / ~3,7 GB (backend 3,2 · postgres 0,5 · redis 0,2 · frontend 0,1) (limites por serviço em deploy.resources).
 # `docker compose up -d --build` sobe tudo e cria o slug MxCMMF6 (serviço seed)
 # para `just stress-mixed` rodar direto.
 services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # Tempo para o checkpoint de desligamento (checkpoints espaçados deixam muito
+    # buffer sujo); sem isso o Docker mata o Postgres e ele entra em crash recovery.
+    stop_grace_period: 60s
     environment:
       POSTGRES_DB: kiip
       POSTGRES_USER: kiip
@@ -14,25 +17,27 @@ services:
     command:
       - postgres
       - -c
-      - shared_buffers=384MB
+      - shared_buffers=512MB
       - -c
-      - effective_cache_size=1GB
+      - effective_cache_size=1536MB
       - -c
-      - work_mem=8MB
+      - work_mem=16MB
       - -c
-      - maintenance_work_mem=64MB
+      - maintenance_work_mem=128MB
       - -c
       - max_connections=100
       - -c
       - synchronous_commit=off
       - -c
-      - wal_compression=on
+      - wal_compression=off
       - -c
-      - wal_buffers=16MB
+      - wal_buffers=64MB
       - -c
-      - max_wal_size=2GB
+      - min_wal_size=2GB
       - -c
-      - checkpoint_timeout=15min
+      - max_wal_size=6GB
+      - -c
+      - checkpoint_timeout=30min
       - -c
       - checkpoint_completion_target=0.9
       - -c
@@ -41,6 +46,10 @@ services:
       - effective_io_concurrency=200
       - -c
       - max_parallel_workers_per_gather=0
+      - -c
+      - autovacuum_max_workers=1
+      - -c
+      - autovacuum_vacuum_insert_scale_factor=1.0
     ports:
       - "5432:5432"
     volumes:
@@ -53,15 +62,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 1536M
+          cpus: "0.5"
+          memory: 2048M
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     # volatile-lru: só expulsa chaves com TTL (cache/contadores), nunca as
     # listas de buffer de links e access logs.
-    command: ["redis-server", "--maxmemory", "768mb", "--maxmemory-policy", "volatile-lru"]
+    command: ["redis-server", "--maxmemory", "640mb", "--maxmemory-policy", "volatile-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -74,8 +83,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: 1024M
+          cpus: "0.2"
+          memory: 768M
 
   # WORKERS processos Bun no mesmo container, balanceados pelo kernel (reusePort);
   # o pool do Postgres (connection_limit) é dividido entre eles.
@@ -84,14 +93,21 @@ services:
       context: .
       dockerfile: apps/backend/Dockerfile
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    # Rede do host: tira o NAT/docker-proxy do caminho (~+25% de req/s). Postgres e
+    # Redis são alcançados pelas portas publicadas em 127.0.0.1.
+    network_mode: host
     environment:
-      DATABASE_URL: postgresql://kiip:kiip_secret@postgres:5432/kiip?connection_limit=30
-      REDIS_HOST: redis
+      DATABASE_URL: postgresql://kiip:kiip_secret@127.0.0.1:5432/kiip?connection_limit=30
+      REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
       PORT: 3000
       WORKERS: 3
+      # Gravação dos logs: lotes maiores e mais espaçados (atraso de poucos segundos é aceitável)
+      ACCESS_REDIS_PUSH_INTERVAL_MS: 250
+      ACCESS_REDIS_PUSH_MAX_BATCH: 2000
+      ACCESS_LOG_THRESHOLD: 5000
+      ACCESS_LOG_FLUSH_BATCH_SIZE: 5000
+      ACCESS_LOG_FLUSH_INTERVAL_MS: 2000
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 3s
@@ -106,19 +122,20 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.4"
-          memory: 1024M
+          cpus: "3.2"
+          memory: 768M
 
   seed:
     image: curlimages/curl:8.10.1
     restart: "no"
+    network_mode: host
     depends_on:
       backend:
         condition: service_healthy
     entrypoint: ["sh", "-c"]
     command:
       - >
-        curl -s -o /dev/null -X POST http://backend:3000/links
+        curl -s -o /dev/null -X POST http://127.0.0.1:3000/links
         -H 'content-type: application/json'
         -d '{"url":"https://example.com","slug":"MxCMMF6"}'
         && echo "slug MxCMMF6 pronto"
@@ -132,6 +149,9 @@ services:
       - "5173:5173"
     environment:
       VITE_API_URL: http://localhost:3000
+    # backend usa a rede do host: o nginx do frontend o alcança pelo gateway
+    extra_hosts:
+      - "backend:host-gateway"
     depends_on:
       - backend
     deploy:
