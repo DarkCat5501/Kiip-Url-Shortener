@@ -27,12 +27,17 @@ type AccessLogEntry = {
 export class RedirectService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RedirectService.name);
   private flushInterval: NodeJS.Timeout | null = null;
+  private redisFlushInterval: NodeJS.Timeout | null = null;
   private isFlushing = false;
+  private pendingLogs: string[] = [];
+  private pendingClicks = new Map<string, number>();
 
   private readonly accessLogThreshold: number;
   private readonly accessLogFlushIntervalMs: number;
   private readonly accessLogFlushBatchSize: number;
   private readonly clickCountTtlSeconds: number;
+  private readonly redisPushIntervalMs: number;
+  private readonly redisPushMaxBatch: number;
 
   constructor(
     private prisma: PrismaService,
@@ -44,6 +49,8 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
     this.accessLogFlushIntervalMs = this.config.get<number>('ACCESS_LOG_FLUSH_INTERVAL_MS', 5000);
     this.accessLogFlushBatchSize = this.config.get<number>('ACCESS_LOG_FLUSH_BATCH_SIZE', 1000);
     this.clickCountTtlSeconds = this.config.get<number>('CLICK_COUNT_TTL_SECONDS', 3600);
+    this.redisPushIntervalMs = this.config.get<number>('ACCESS_REDIS_PUSH_INTERVAL_MS', 100);
+    this.redisPushMaxBatch = this.config.get<number>('ACCESS_REDIS_PUSH_MAX_BATCH', 500);
   }
 
   async onModuleInit() {
@@ -54,12 +61,20 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
     this.flushInterval = setInterval(() => {
       this.flushLogs().catch((err) => this.logger.error('Failed to flush logs', err));
     }, this.accessLogFlushIntervalMs);
+
+    this.redisFlushInterval = setInterval(() => {
+      this.pushPendingToRedis().catch((err) => this.logger.error('Failed to push accesses to Redis', err));
+    }, this.redisPushIntervalMs);
   }
 
   async onModuleDestroy() {
     if (this.flushInterval) {
       clearInterval(this.flushInterval);
     }
+    if (this.redisFlushInterval) {
+      clearInterval(this.redisFlushInterval);
+    }
+    await this.pushPendingToRedis().catch((err) => this.logger.error('Failed final push to Redis', err));
     await this.flushLogs().catch((err) => this.logger.error('Failed final flush on shutdown', err));
   }
 
@@ -179,21 +194,30 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    this.recordAccessInBackground(slug, res.req.headers.referer, res.req.headers['user-agent'], res.req.ip);
+    this.recordAccess(slug, res.req.headers.referer, res.req.headers['user-agent'], res.req.ip);
 
     return { url: link.url, status: RedirectStatus.OK };
   }
 
-  private recordAccessInBackground(
+  private recordAccess(
     slug: string,
     referer?: string,
     userAgent?: string | string[],
     ip?: string,
   ): void {
-    Promise.all([
-      this.logAccessAsync(slug, referer, userAgent, ip),
-      this.incrementClickCount(slug),
-    ]).catch((err) => this.logger.warn(`Failed to record access for link '${slug}'`, err));
+    const log: AccessLogEntry = {
+      slug,
+      referer: referer || undefined,
+      userAgent: Array.isArray(userAgent) ? userAgent[0] : userAgent,
+      ip,
+    };
+
+    this.pendingLogs.push(JSON.stringify(log));
+    this.pendingClicks.set(slug, (this.pendingClicks.get(slug) ?? 0) + 1);
+
+    if (this.pendingLogs.length >= this.redisPushMaxBatch) {
+      this.pushPendingToRedis().catch((err) => this.logger.error('Failed to push accesses to Redis', err));
+    }
   }
 
   private deactivateInBackground(slug: string): void {
@@ -202,32 +226,33 @@ export class RedirectService implements OnModuleInit, OnModuleDestroy {
       .catch((err) => this.logger.warn(`Failed to persist deactivation for '${slug}' (will retry on next hit)`));
   }
 
-  private async incrementClickCount(slug: string): Promise<void> {
-    const key = REDIS_CLICK_COUNT_KEY(slug);
-    await Promise.all([
-      this.redis.incrby(key, 1),
-      this.redis.expire(key, this.clickCountTtlSeconds)
-    ]);
-  }
+  // Um round-trip por lote (não por click). Se falhar, devolve o lote ao buffer
+  // em memória para a próxima tentativa.
+  private async pushPendingToRedis(): Promise<void> {
+    if (this.pendingLogs.length === 0) return;
 
-  private async logAccessAsync(
-    slug: string,
-    referer?: string,
-    userAgent?: string | string[],
-    ip?: string,
-  ) {
-    const log: AccessLogEntry = {
-      slug,
-      referer: referer || undefined,
-      userAgent: Array.isArray(userAgent) ? userAgent[0] : userAgent,
-      ip,
-    };
+    const logs = this.pendingLogs;
+    const clicks = this.pendingClicks;
+    this.pendingLogs = [];
+    this.pendingClicks = new Map();
 
-    await this.redis.lpush(ACCESS_LOG_BUFFER_KEY, [JSON.stringify(log)]);
+    try {
+      const bufferLen = await this.redis.pushBatch(
+        ACCESS_LOG_BUFFER_KEY,
+        logs,
+        new Map([...clicks].map(([slug, delta]) => [REDIS_CLICK_COUNT_KEY(slug), delta])),
+        this.clickCountTtlSeconds,
+      );
 
-    const bufferLen = await this.redis.llen(ACCESS_LOG_BUFFER_KEY);
-    if (bufferLen >= this.accessLogThreshold) {
-      this.flushLogs().catch((err) => this.logger.error('Failed to flush logs', err));
+      if (bufferLen >= this.accessLogThreshold) {
+        this.flushLogs().catch((err) => this.logger.error('Failed to flush logs', err));
+      }
+    } catch (err) {
+      this.pendingLogs.unshift(...logs);
+      for (const [slug, delta] of clicks) {
+        this.pendingClicks.set(slug, (this.pendingClicks.get(slug) ?? 0) + delta);
+      }
+      throw err;
     }
   }
 }
