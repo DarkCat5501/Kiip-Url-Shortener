@@ -50,6 +50,11 @@ export namespace LinksService {
   // relação a uma desativação feita por outra instância.
   const localCacheTtlMs = getNumber('LOCAL_CACHE_TTL_MS', 2000);
   const localCacheMaxSize = getNumber('LOCAL_CACHE_MAX_SIZE', 1000);
+  // O clickCount persistido só muda a cada flush de cliques (segundos), então
+  // reler o banco por redirect não traz precisão; o limite maxClicks pode
+  // estourar em até um TTL de cliques.
+  const persistedCountTtlMs = getNumber('PERSISTED_COUNT_TTL_MS', 1000);
+  const persistedCountCache = new Map<string, { count: number; expiresAt: number }>();
 
   export async function init() {
     await flushLinks();
@@ -107,7 +112,7 @@ export namespace LinksService {
       await sql`INSERT INTO links ${sql(rows, 'slug', 'url', 'expires_at', 'max_clicks', 'updated_at')}`;
     } catch (err) {
       logger.warn(`Failed to flush ${links.length} links (will retry)`);
-      await RedisService.lpush(LINK_BUFFER_KEY, links.map((link) => JSON.stringify(link)));
+      await RedisService.requeue(LINK_BUFFER_KEY, links.map((link) => JSON.stringify(link)));
     }
   }
 
@@ -142,7 +147,7 @@ export namespace LinksService {
       expiresAt: dto.expiresAt || null,
       maxClicks: dto.maxClicks ?? null,
     };
-    const bufferLen = await RedisService.lpush(LINK_BUFFER_KEY, [JSON.stringify(bufferedLink)]);
+    const bufferLen = await RedisService.rpush(LINK_BUFFER_KEY, [JSON.stringify(bufferedLink)]);
     if (bufferLen >= linkBufferThreshold) {
       flushLinks().catch((err) => logger.error('Failed to flush links', err));
     }
@@ -279,7 +284,7 @@ export namespace LinksService {
     localCache.delete(slug);
   }
 
-  // create() não é atômico: entre o cache ser populado e o lpush no buffer,
+  // create() não é atômico: entre o cache ser populado e o rpush no buffer,
   // uma requisição concorrente pode achar o link via findBySlug (cache) mas
   // ainda não no buffer nem no Postgres. Sem isso, o update não acharia a linha.
   const MAX_UPDATE_RETRY_ATTEMPTS = 3;
@@ -359,6 +364,17 @@ export namespace LinksService {
   export async function getPersistedClickCount(slug: string): Promise<number> {
     const [row] = await sql`SELECT click_count FROM links WHERE slug = ${slug}`;
     return row?.click_count ?? 0;
+  }
+
+  // Versão com cache curto para o hot path do redirect (ver persistedCountTtlMs).
+  export async function getPersistedClickCountCached(slug: string): Promise<number> {
+    const entry = persistedCountCache.get(slug);
+    if (entry && entry.expiresAt > Date.now()) return entry.count;
+
+    const count = await getPersistedClickCount(slug);
+    if (persistedCountCache.size >= localCacheMaxSize) persistedCountCache.clear();
+    persistedCountCache.set(slug, { count, expiresAt: Date.now() + persistedCountTtlMs });
+    return count;
   }
 
   // Ignora o cache do link: ele nunca tem id (ver stripId).

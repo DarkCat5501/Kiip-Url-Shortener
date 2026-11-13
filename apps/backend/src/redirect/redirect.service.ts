@@ -85,63 +85,54 @@ export namespace RedirectService {
     }
   }
 
+  // Um único statement (atômico sob READ COMMITTED, o padrão do Postgres): insere
+  // os logs, soma os cliques em links e devolve só os slugs que existem no banco.
+  // O delta pendente no Redis é abatido apenas pelo que foi de fato persistido;
+  // logs de links ainda não persistidos voltam ao buffer.
   async function flushBatch(logs: AccessLogEntry[]) {
-    const slugs = Array.from(new Set(logs.map((log) => log.slug)));
-    const links = await sql<{ id: string; slug: string }[]>`SELECT id, slug FROM links WHERE slug IN ${sql(slugs)}`;
-    const idBySlug = new Map(links.map((l) => [l.slug, l.id]));
-
-    const resolvedLogs = logs
-      .map((log) => {
-        const linkId = idBySlug.get(log.slug);
-        if (linkId === undefined) return null;
-        return { link_id: linkId, referer: log.referer ?? null, user_agent: log.userAgent ?? null, ip: log.ip ?? null };
-      })
-      .filter((log): log is NonNullable<typeof log> => log !== null);
-
-    const unresolvedLogs = logs.filter((log) => !idBySlug.has(log.slug));
+    let persisted: { slug: string; n: number }[];
 
     try {
-      if (resolvedLogs.length > 0) {
-        await sql`INSERT INTO access_logs ${sql(resolvedLogs, 'link_id', 'referer', 'user_agent', 'ip')}`;
-      }
+      persisted = await sql<{ slug: string; n: number }[]>`
+        WITH batch AS (
+          SELECT * FROM UNNEST(
+            ${sql.array(logs.map((l) => l.slug), 'TEXT')}::text[],
+            ${sql.array(logs.map((l) => l.referer ?? null), 'TEXT')}::text[],
+            ${sql.array(logs.map((l) => l.userAgent ?? null), 'TEXT')}::text[],
+            ${sql.array(logs.map((l) => l.ip ?? null), 'TEXT')}::text[]
+          ) AS t(slug, referer, user_agent, ip)
+        ), ins AS (
+          INSERT INTO access_logs (link_id, referer, user_agent, ip)
+          SELECT l.id, b.referer, b.user_agent, b.ip
+          FROM batch b JOIN links l ON l.slug = b.slug
+          RETURNING link_id
+        ), counts AS (
+          SELECT link_id, COUNT(*)::int AS n FROM ins GROUP BY link_id
+        ), upd AS (
+          UPDATE links l SET click_count = l.click_count + c.n
+          FROM counts c WHERE l.id = c.link_id
+          RETURNING l.slug, c.n
+        )
+        SELECT slug, n FROM upd
+      `;
     } catch (err) {
-      logger.warn(`Failed to flush ${resolvedLogs.length} access logs (will retry)`);
-      await RedisService.lpush(ACCESS_LOG_BUFFER_KEY, logs.map((log) => JSON.stringify(log)));
+      logger.warn(`Failed to flush ${logs.length} access logs (will retry)`);
+      await RedisService.requeue(ACCESS_LOG_BUFFER_KEY, logs.map((log) => JSON.stringify(log)));
       return;
     }
 
+    const persistedSlugs = new Set(persisted.map((row) => row.slug));
+    const unresolvedLogs = logs.filter((log) => !persistedSlugs.has(log.slug));
+
     if (unresolvedLogs.length > 0) {
       logger.warn(`${unresolvedLogs.length} access logs waiting for their link to persist (will retry)`);
-      await RedisService.lpush(ACCESS_LOG_BUFFER_KEY, unresolvedLogs.map((log) => JSON.stringify(log)));
+      await RedisService.requeue(ACCESS_LOG_BUFFER_KEY, unresolvedLogs.map((log) => JSON.stringify(log)));
     }
 
-    await flushClickCounts(logs.map((log) => log.slug));
-  }
-
-  async function flushClickCounts(slugs: string[]) {
-    const deltaBySlug = new Map<string, number>();
-    slugs.forEach((slug) => deltaBySlug.set(slug, (deltaBySlug.get(slug) ?? 0) + 1));
-
-    const entries = Array.from(deltaBySlug.entries());
-
     try {
-      await sql`
-        UPDATE links AS l
-        SET click_count = l.click_count + d.delta
-        FROM (
-          SELECT * FROM UNNEST(
-            ${sql.array(entries.map(([slug]) => slug), 'TEXT')}::text[],
-            ${sql.array(entries.map(([, delta]) => delta), 'INT')}::int[]
-          ) AS t(slug, delta)
-        ) AS d
-        WHERE l.slug = d.slug
-      `;
-
-      for (const [slug, delta] of entries) {
-        await RedisService.incrby(REDIS_CLICK_COUNT_KEY(slug), -delta);
-      }
+      await RedisService.incrbyMany(new Map(persisted.map(({ slug, n }) => [REDIS_CLICK_COUNT_KEY(slug), -n])));
     } catch (err) {
-      logger.warn(`Failed to sync click counts for ${entries.length} links (will retry)`);
+      logger.warn(`Failed to decrement pending click counts for ${persisted.length} links`);
     }
   }
 
@@ -164,7 +155,7 @@ export namespace RedirectService {
 
     if (link.maxClicks) {
       const [persistedCount, pendingDelta] = await Promise.all([
-        LinksService.getPersistedClickCount(slug),
+        LinksService.getPersistedClickCountCached(slug),
         RedisService.getCounter(REDIS_CLICK_COUNT_KEY(slug)),
       ]);
       const clickCount = persistedCount + pendingDelta;

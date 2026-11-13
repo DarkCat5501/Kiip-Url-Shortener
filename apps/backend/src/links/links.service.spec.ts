@@ -15,7 +15,8 @@ const mockRedis = {
   set: mock(async () => {}),
   del: mock(async () => {}),
   delByPattern: mock(async () => {}),
-  lpush: mock(async () => 0),
+  rpush: mock(async () => 0),
+  requeue: mock(async () => 0),
   lpopall: mock(async () => []),
   getCounter: mock(async () => 0),
   getCounters: mock(async () => []),
@@ -57,7 +58,7 @@ describe('LinksService', () => {
       expect(result.url).toBe('https://example.com');
       expect(result.slug).toHaveLength(7);
       expect(mockRedis.set).toHaveBeenCalled();
-      expect(mockRedis.lpush).toHaveBeenCalled();
+      expect(mockRedis.rpush).toHaveBeenCalled();
     });
 
     it('should create a link with custom slug', async () => {

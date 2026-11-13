@@ -1,8 +1,6 @@
 import { RedisClient } from 'bun';
 import { getNumber, getString } from '../_core/config.js';
 
-// O client nativo do Bun faz auto-pipelining: comandos emitidos no mesmo tick
-// seguem juntos pela mesma conexão, então não precisa de pool.
 export namespace RedisService {
   const client = new RedisClient(`redis://${getString('REDIS_HOST', 'localhost')}:${getNumber('REDIS_PORT', 6379)}`);
 
@@ -46,6 +44,20 @@ export namespace RedisService {
     return client.incrby(key, delta);
   }
 
+  // Soma vários deltas em um único comando (EVAL): KEYS[i] += ARGV[i].
+  const INCRBY_MANY_SCRIPT = `
+    for i = 1, #KEYS do
+      redis.call('INCRBY', KEYS[i], ARGV[i])
+    end
+  `;
+
+  export async function incrbyMany(deltas: Map<string, number>): Promise<void> {
+    if (deltas.size === 0) return;
+    const keys = [...deltas.keys()];
+    const args = [...deltas.values()].map(String);
+    await client.send('EVAL', [INCRBY_MANY_SCRIPT, String(keys.length), ...keys, ...args]);
+  }
+
   export async function getCounter(key: string): Promise<number> {
     const value = await client.get(key);
     return value ? Number(value) : 0;
@@ -57,10 +69,17 @@ export namespace RedisService {
     return values.map((v) => (v ? Number(v) : 0));
   }
 
-  // List operations for buffering. `values` is capped by callers (max 1000/batch)
-  // to stay well under JS engine argument-spread limits.
-  export async function lpush(key: string, values: string[]): Promise<number> {
-    return (await client.send('LPUSH', [key, ...values])) as number;
+  // Filas de buffer: produtores usam RPUSH (cauda) e o consumidor LPOP (cabeça),
+  // então a ordem é FIFO. `values` é limitado pelos chamadores (máx. 1000/lote)
+  // para ficar bem abaixo do limite de argumentos.
+  export async function rpush(key: string, values: string[]): Promise<number> {
+    return (await client.send('RPUSH', [key, ...values])) as number;
+  }
+
+  // Devolve itens que falharam à cabeça da fila, mantendo a ordem original
+  // (LPUSH insere um a um, então o lote vai invertido).
+  export async function requeue(key: string, values: string[]): Promise<number> {
+    return (await client.send('LPUSH', [key, ...values.toReversed()])) as number;
   }
 
   // Read and remove up to `limit` items from the list in a single roundtrip
@@ -70,20 +89,28 @@ export namespace RedisService {
     return items.map((item) => JSON.parse(item));
   }
 
-  // Empilha os logs e soma os deltas dos contadores pendentes; os comandos vão
-  // juntos via auto-pipelining. Retorna o tamanho do buffer após o push.
+  // KEYS[1] = lista; KEYS[2..] = contadores; ARGV[1] = ttl; ARGV[2..n+1] = deltas
+  // (n = #KEYS - 1); o restante de ARGV são os valores do RPUSH.
+  const PUSH_BATCH_SCRIPT = `
+    local n = #KEYS - 1
+    for i = 1, n do
+      redis.call('INCRBY', KEYS[i + 1], ARGV[i + 1])
+      redis.call('EXPIRE', KEYS[i + 1], ARGV[1])
+    end
+    return redis.call('RPUSH', KEYS[1], unpack(ARGV, n + 2))
+  `;
+
+  // Um único comando (EVAL) por lote: enfileira os logs (RPUSH) e soma os deltas dos
+  // contadores pendentes de forma atômica. Retorna o tamanho do buffer.
   export async function pushBatch(
     listKey: string,
     values: string[],
     counterDeltas: Map<string, number>,
     counterTtlSeconds: number,
   ): Promise<number> {
-    const commands: Promise<unknown>[] = [client.send('LPUSH', [listKey, ...values])];
-    for (const [key, delta] of counterDeltas) {
-      commands.push(client.incrby(key, delta), client.expire(key, counterTtlSeconds));
-    }
+    const keys = [listKey, ...counterDeltas.keys()];
+    const args = [String(counterTtlSeconds), ...[...counterDeltas.values()].map(String), ...values];
 
-    const [length] = await Promise.all(commands);
-    return length as number;
+    return (await client.send('EVAL', [PUSH_BATCH_SCRIPT, String(keys.length), ...keys, ...args])) as number;
   }
 }
