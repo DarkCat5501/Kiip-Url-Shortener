@@ -1,40 +1,35 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service.js';
+import { PostgresService } from '../postgres/postgres.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { LinksService, isEffectivelyActive } from '../links/links.service.js';
+import { HttpError } from '../_core/http.js';
 import { REDIS_CLICK_COUNT_KEY } from '../_core/constants.js';
 
-@Injectable()
-export class StatsService {
-  constructor(
-    private prisma: PrismaService,
-    private redis: RedisService,
-    private linksService: LinksService,
-  ) {}
+const sql = PostgresService.sql;
 
-  async getStats(slug: string) {
+export namespace StatsService {
+  export async function getStats(slug: string) {
     const cacheKey = `stats:${slug}`;
-    const cached = await this.redis.get<any>(cacheKey);
+    const cached = await RedisService.get<any>(cacheKey);
     if (cached) return cached;
 
     // findBySlug passa pelo cache L1/L2 antes do banco — necessário porque um
     // link recém-criado pode ainda estar só no buffer de escrita em lote,
     // sem ter sido persistido no Postgres (o flush roda a cada 2s ou 20 itens).
-    const link = await this.linksService.findBySlug(slug);
+    const link = await LinksService.findBySlug(slug);
 
     if (!link) {
-      throw new NotFoundException(`Link with slug '${slug}' not found`);
+      throw new HttpError(404, `Link with slug '${slug}' not found`);
     }
 
     // Resolve o id real do banco: o cache do link pode não ter id se ele
     // ainda não foi persistido pelo flush do buffer de criação.
-    const linkId = await this.linksService.getPersistedId(slug);
+    const linkId = await LinksService.getPersistedId(slug);
 
     const [persistedCount, pendingDelta, dailyStats, recentAccesses] = await Promise.all([
-      this.linksService.getPersistedClickCount(slug),
-      this.redis.getCounter(REDIS_CLICK_COUNT_KEY(slug)),
-      linkId !== null ? this.getDailyStats(linkId) : Promise.resolve([]),
-      linkId !== null ? this.getRecentAccesses(linkId) : Promise.resolve([]),
+      LinksService.getPersistedClickCount(slug),
+      RedisService.getCounter(REDIS_CLICK_COUNT_KEY(slug)),
+      linkId !== null ? getDailyStats(linkId) : Promise.resolve([]),
+      linkId !== null ? getRecentAccesses(linkId) : Promise.resolve([]),
     ]);
 
     const totalClicks = persistedCount + pendingDelta;
@@ -51,25 +46,23 @@ export class StatsService {
 
     // Cache for 5s: protege contra rajadas de leitura no mesmo link sem deixar
     // a tela de stats visivelmente desatualizada por muito tempo
-    await this.redis.set(cacheKey, result, 5);
+    await RedisService.set(cacheKey, result, 5);
 
     return result;
   }
 
-  private async getDailyStats(linkId: bigint) {
+  async function getDailyStats(linkId: string) {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const raw = await this.prisma.$queryRaw<
-      Array<{ date: Date; count: bigint }>
-    >`
+    const raw = await sql<Array<{ date: Date; count: string }>>`
       SELECT
-        DATE("accessed_at") as date,
-        COUNT(*) as count
-      FROM "access_logs"
-      WHERE "link_id" = ${linkId}
-        AND "accessed_at" >= ${sevenDaysAgo}
-      GROUP BY DATE("accessed_at")
+        DATE(accessed_at) AS date,
+        COUNT(*) AS count
+      FROM access_logs
+      WHERE link_id = ${linkId}
+        AND accessed_at >= ${sevenDaysAgo}
+      GROUP BY DATE(accessed_at)
       ORDER BY date DESC
     `;
 
@@ -79,16 +72,19 @@ export class StatsService {
     }));
   }
 
-  private async getRecentAccesses(linkId: bigint) {
-    return this.prisma.accessLog.findMany({
-      where: { linkId },
-      orderBy: { accessedAt: 'desc' },
-      take: 20,
-      select: {
-        accessedAt: true,
-        referer: true,
-        userAgent: true,
-      },
-    });
+  async function getRecentAccesses(linkId: string) {
+    const rows = await sql<Array<{ accessed_at: Date; referer: string | null; user_agent: string | null }>>`
+      SELECT accessed_at, referer, user_agent
+      FROM access_logs
+      WHERE link_id = ${linkId}
+      ORDER BY accessed_at DESC
+      LIMIT 20
+    `;
+
+    return rows.map((row) => ({
+      accessedAt: row.accessed_at,
+      referer: row.referer,
+      userAgent: row.user_agent,
+    }));
   }
 }

@@ -1,174 +1,145 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { LinksService } from './links.service.js';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { HttpError } from '../_core/http.js';
 
-// Mock PrismaService
-const mockPrisma = {
-  link: {
-    findUnique: vi.fn(),
-    create: vi.fn(),
-    findMany: vi.fn(),
-    update: vi.fn(),
-  },
-};
+// sql é usado como template tag (consulta, consome o próximo resultado da
+// fila) e como helper de fragmento (sql(rows, ...cols), não consome).
+const queryResults: unknown[] = [];
+const sqlMock = mock((first: unknown, ..._rest: unknown[]) => {
+  const isTemplate = Array.isArray(first) && 'raw' in first;
+  return isTemplate ? Promise.resolve(queryResults.shift() ?? []) : first;
+});
+const queueQuery = (rows: unknown[]) => queryResults.push(rows);
 
-// Mock RedisService
 const mockRedis = {
-  get: vi.fn(),
-  set: vi.fn(),
-  del: vi.fn(),
-  delByPattern: vi.fn(),
-  lpush: vi.fn(),
-  llen: vi.fn().mockResolvedValue(0),
-  getCounter: vi.fn().mockResolvedValue(0),
-  getCounters: vi.fn().mockResolvedValue([]),
+  get: mock(async (_key: string): Promise<unknown> => null),
+  set: mock(async () => {}),
+  del: mock(async () => {}),
+  delByPattern: mock(async () => {}),
+  lpush: mock(async () => 0),
+  lpopall: mock(async () => []),
+  getCounter: mock(async () => 0),
+  getCounters: mock(async () => []),
 };
 
-// Mock ConfigService: retorna sempre o default passado (segundo argumento de get)
-const mockConfig = {
-  get: vi.fn((_key: string, defaultValue?: unknown) => defaultValue),
-};
+mock.module('../postgres/postgres.service.js', () => ({ PostgresService: { sql: sqlMock } }));
+mock.module('../redis/redis.service.js', () => ({ RedisService: mockRedis }));
+
+const { LinksService } = await import('./links.service.js');
+
+const linkRow = (overrides: Record<string, unknown> = {}) => ({
+  id: '123',
+  slug: 'abc',
+  url: 'https://example.com',
+  active: true,
+  expires_at: null,
+  max_clicks: null,
+  click_count: 0,
+  created_at: new Date(),
+  updated_at: new Date(),
+  ...overrides,
+});
 
 describe('LinksService', () => {
-  let service: LinksService;
-
   beforeEach(() => {
-    vi.clearAllMocks();
-    service = new LinksService(mockPrisma as any, mockRedis as any, mockConfig as any);
+    queryResults.length = 0;
+    sqlMock.mockClear();
+    mockRedis.get.mockReset().mockResolvedValue(null);
+    mockRedis.set.mockClear();
+    mockRedis.del.mockClear();
+    mockRedis.getCounter.mockReset().mockResolvedValue(0);
   });
 
   describe('create', () => {
-    it('should create a link with auto-generated slug', async () => {
-      const dto = { url: 'https://example.com' };
-      const mockLink = {
-        id: 123n,
-        slug: 'abc1234',
-        url: 'https://example.com',
-        active: true,
-        expiresAt: null,
-        maxClicks: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      mockPrisma.link.create.mockResolvedValue(mockLink);
-
-      const result = await service.create(dto);
+    it('should create a link with auto-generated slug and buffer it', async () => {
+      const result = await LinksService.create({ url: 'https://example.com' });
 
       expect(result).toHaveProperty('shortUrl');
       expect(result.url).toBe('https://example.com');
-      expect(result.slug).toBeDefined();
-      expect(mockPrisma.link.create).toHaveBeenCalled();
+      expect(result.slug).toHaveLength(7);
       expect(mockRedis.set).toHaveBeenCalled();
+      expect(mockRedis.lpush).toHaveBeenCalled();
     });
 
     it('should create a link with custom slug', async () => {
-      const dto = { url: 'https://example.com', slug: 'custom' };
-      const mockLink = {
-        id: 123n,
-        slug: 'custom',
-        url: 'https://example.com',
-        active: true,
-        expiresAt: null,
-        maxClicks: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
+      queueQuery([]);
 
-      mockPrisma.link.findUnique.mockResolvedValue(null);
-      mockPrisma.link.create.mockResolvedValue(mockLink);
-
-      const result = await service.create(dto);
+      const result = await LinksService.create({ url: 'https://example.com', slug: 'custom' });
 
       expect(result.slug).toBe('custom');
     });
 
-    it('should throw ConflictException if custom slug already exists', async () => {
-      const dto = { url: 'https://example.com', slug: 'taken' };
+    it('should throw HttpError(409) if custom slug already exists', async () => {
+      queueQuery([{ id: '999' }]);
 
-      mockPrisma.link.findUnique.mockResolvedValue({ id: 999n });
-
-      await expect(service.create(dto)).rejects.toThrow(ConflictException);
+      await expect(LinksService.create({ url: 'https://example.com', slug: 'taken' })).rejects.toMatchObject({
+        status: 409,
+      });
     });
   });
 
   describe('findOne', () => {
     it('should return a link with click count', async () => {
-      const mockLink = {
-        id: 123n,
-        slug: 'abc',
-        url: 'https://example.com',
-        active: true,
-        clickCount: 40,
-      };
-
-      mockPrisma.link.findUnique.mockResolvedValue(mockLink);
+      queueQuery([linkRow({ click_count: 40 })]);
       mockRedis.getCounter.mockResolvedValue(2);
 
-      const result = await service.findOne('abc');
+      const result = await LinksService.findOne('abc');
 
       expect(result.clickCount).toBe(42);
       expect(result.url).toBe('https://example.com');
+      expect(result).not.toHaveProperty('id');
     });
 
-    it('should throw NotFoundException if link not found', async () => {
-      mockPrisma.link.findUnique.mockResolvedValue(null);
+    it('should throw HttpError(404) if link not found', async () => {
+      queueQuery([]);
 
-      await expect(service.findOne('nonexistent')).rejects.toThrow(NotFoundException);
+      await expect(LinksService.findOne('nonexistent')).rejects.toMatchObject({ status: 404 });
     });
   });
 
   describe('deactivate', () => {
     it('should deactivate a link and clear cache', async () => {
-      const mockLink = { id: 123n, slug: 'abc' };
-      const mockUpdated = { ...mockLink, active: false };
+      queueQuery([linkRow()]); // findBySlug
+      queueQuery([{ slug: 'abc' }]); // existência antes do update
+      queueQuery([linkRow({ active: false })]); // update
 
-      mockPrisma.link.findUnique.mockResolvedValue(mockLink);
-      mockPrisma.link.update.mockResolvedValue(mockUpdated);
-
-      const result = await service.deactivate('abc');
+      const result = await LinksService.deactivate('abc');
 
       expect(result.active).toBe(false);
       expect(mockRedis.del).toHaveBeenCalledWith('l:abc');
     });
 
-    it('should throw NotFoundException if link not found', async () => {
-      mockPrisma.link.findUnique.mockResolvedValue(null);
+    it('should throw HttpError(404) if link not found', async () => {
+      queueQuery([]);
 
-      await expect(service.deactivate('nonexistent')).rejects.toThrow(NotFoundException);
+      await expect(LinksService.deactivate('nonexistent')).rejects.toBeInstanceOf(HttpError);
     });
   });
 
   describe('findBySlug', () => {
     it('should return cached link if available', async () => {
-      const cachedLink = { id: 123n, slug: 'abc', url: 'https://example.com' };
-
+      const cachedLink = { slug: 'abc', url: 'https://example.com' };
       mockRedis.get.mockResolvedValue(cachedLink);
 
-      const result = await service.findBySlug('abc');
+      const result = await LinksService.findBySlug('abc');
 
-      expect(result).toEqual(cachedLink);
-      expect(mockPrisma.link.findUnique).not.toHaveBeenCalled();
+      expect(result).toEqual(cachedLink as any);
+      expect(sqlMock).not.toHaveBeenCalled();
     });
 
     it('should fetch from database and cache if not in cache (without id)', async () => {
-      const dbLink = { id: 123n, slug: 'abc', url: 'https://example.com' };
-      const withoutId = { slug: 'abc', url: 'https://example.com' };
+      queueQuery([linkRow({ slug: 'xyz' })]);
 
-      mockRedis.get.mockResolvedValue(null);
-      mockPrisma.link.findUnique.mockResolvedValue(dbLink);
+      const result = await LinksService.findBySlug('xyz');
 
-      const result = await service.findBySlug('abc');
-
-      expect(result).toEqual(withoutId);
-      expect(mockRedis.set).toHaveBeenCalledWith('l:abc', withoutId, 3600);
+      expect(result).not.toBeNull();
+      expect(result).not.toHaveProperty('id');
+      expect(mockRedis.set).toHaveBeenCalledWith('l:xyz', result, 3600);
     });
 
     it('should return null if link not found anywhere', async () => {
-      mockRedis.get.mockResolvedValue(null);
-      mockPrisma.link.findUnique.mockResolvedValue(null);
+      queueQuery([]);
 
-      const result = await service.findBySlug('nonexistent');
+      const result = await LinksService.findBySlug('nonexistent');
 
       expect(result).toBeNull();
     });

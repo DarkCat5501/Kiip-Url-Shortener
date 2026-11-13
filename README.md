@@ -51,9 +51,6 @@ bun install
 # Suba apenas banco e cache
 docker compose up -d postgres redis
 
-# Rode migrations
-cd apps/backend && bunx prisma migrate deploy
-
 # Inicie em modo dev
 bun dev:backend  # Terminal 1
 bun dev:frontend # Terminal 2
@@ -90,7 +87,7 @@ Em `scripts/` (executáveis via `bun run` diretamente):
 ```
 kiip/
 ├── apps/
-│   ├── backend/        # NestJS API
+│   ├── backend/        # API (Bun.serve)
 │   └── frontend/       # React + Vite
 ├── scripts/            # Scripts de stress test e diagnóstico
 ├── docker-compose.yml
@@ -103,8 +100,8 @@ kiip/
 ```
 apps/backend/src/
 ├── main.ts              # Bootstrap da aplicação
-├── app.module.ts        # Módulo raiz
-├── prisma/              # Serviço de banco de dados
+├── app.ts               # Rotas (Bun.serve), CORS e tratamento de erros
+├── postgres/            # Serviço de banco de dados (Bun.SQL); schema em apps/backend/db/schema.sql, aplicado no boot
 ├── redis/               # Serviço de cache (Redis)
 ├── links/               # CRUD de links, cache L1 em memória, paginação
 ├── redirect/             # Endpoint de redirect, buffer de logs e contador de cliques
@@ -168,8 +165,8 @@ curl -X PATCH http://localhost:3000/links/meulink -H "Content-Type: application/
 
 | Camada | Tecnologia | Justificativa |
 |--------|-----------|---------------|
-| Backend | NestJS + TypeScript | Framework modular com DI, fácil de testar e manter |
-| ORM | Prisma v5 | Typesafe, migrations versionadas, bom DX |
+| Backend | Bun.serve + TypeScript (namespaces) | Runtime e HTTP server nativos, sem framework nem DI |
+| Acesso a dados | `Bun.SQL` e `Bun.RedisClient` | Drivers nativos, sem ORM; schema idempotente aplicado no boot |
 | Banco | PostgreSQL 17 | Robusto, suporte nativo a JSON, índices eficientes e identity columns |
 | Cache | Redis 7 + cache local em memória (LRU) | Redirects rápidos sem hit no banco para URLs populares |
 | ID Generator | nanoid | URL-safe, curto (7 chars), colisões mínimas, sem dependência de DB |
