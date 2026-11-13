@@ -27,18 +27,6 @@ export namespace RedisService {
     await client.del(key);
   }
 
-  // Deletes all keys matching a glob pattern via non-blocking SCAN cursor
-  export async function delByPattern(pattern: string): Promise<void> {
-    let cursor = '0';
-    do {
-      const [nextCursor, keys] = (await client.send('SCAN', [cursor, 'MATCH', pattern, 'COUNT', '500'])) as [string, string[]];
-      cursor = nextCursor;
-      if (keys.length > 0) {
-        await client.send('DEL', keys);
-      }
-    } while (cursor !== '0');
-  }
-
   // Atomic counter operations (stored as raw strings, not JSON)
   export async function incrby(key: string, delta: number): Promise<number> {
     return client.incrby(key, delta);

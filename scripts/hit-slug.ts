@@ -73,9 +73,9 @@ instance.on('done', (result) => {
   console.log(`RESULTADO: GET /${slug}`);
   console.log('='.repeat(60));
   console.log(`Requests:     ${result.requests.total.toLocaleString()}`);
-  console.log(`Duração:      ${(result.duration / 1000).toFixed(1)}s`);
+  console.log(`Duração:      ${result.duration.toFixed(1)}s`);
   console.log(`Throughput:   ${(result.throughput.total / 1024 / 1024).toFixed(2)} MB/s`);
-  console.log(`Req/s:        ${(result.requests.total / (result.duration / 1000)).toFixed(0)}`);
+  console.log(`Req/s:        ${(result.requests.total / result.duration).toFixed(0)}`);
   console.log(`Latency p50:  ${result.latency.p50}ms`);
   console.log(`Latency p99:  ${result.latency.p99}ms`);
   console.log(`Latency max:  ${result.latency.max}ms`);

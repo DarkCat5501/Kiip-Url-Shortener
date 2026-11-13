@@ -1,3 +1,6 @@
+# Orçamento total: 4 vCPU / ~3,7 GB (limites por serviço em deploy.resources).
+# `docker compose up -d --build` sobe tudo e cria o slug MxCMMF6 (serviço seed)
+# para `just stress-mixed` rodar direto.
 services:
   postgres:
     image: postgres:17-alpine
@@ -6,6 +9,38 @@ services:
       POSTGRES_DB: kiip
       POSTGRES_USER: kiip
       POSTGRES_PASSWORD: kiip_secret
+    # synchronous_commit=off: um crash pode perder os últimos ~600ms de commits
+    # (sem corrupção); aceitável para access logs/contadores.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=100
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_compression=on
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - max_parallel_workers_per_gather=0
     ports:
       - "5432:5432"
     volumes:
@@ -19,11 +54,14 @@ services:
       resources:
         limits:
           cpus: "1"
-          memory: 512M
+          memory: 1536M
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # volatile-lru: só expulsa chaves com TTL (cache/contadores), nunca as
+    # listas de buffer de links e access logs.
+    command: ["redis-server", "--maxmemory", "768mb", "--maxmemory-policy", "volatile-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -36,9 +74,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 512M
+          cpus: "0.5"
+          memory: 1024M
 
+  # WORKERS processos Bun no mesmo container, balanceados pelo kernel (reusePort);
+  # o pool do Postgres (connection_limit) é dividido entre eles.
   backend:
     build:
       context: .
@@ -47,12 +87,17 @@ services:
     ports:
       - "3000:3000"
     environment:
-      DATABASE_URL: postgresql://kiip:kiip_secret@postgres:5432/kiip
+      DATABASE_URL: postgresql://kiip:kiip_secret@postgres:5432/kiip?connection_limit=30
       REDIS_HOST: redis
       REDIS_PORT: 6379
       PORT: 3000
-      THROTTLE_TTL: 60000
-      THROTTLE_LIMIT: 30
+      WORKERS: 3
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,8 +106,22 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 512M
+          cpus: "2.4"
+          memory: 1024M
+
+  seed:
+    image: curlimages/curl:8.10.1
+    restart: "no"
+    depends_on:
+      backend:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        curl -s -o /dev/null -X POST http://backend:3000/links
+        -H 'content-type: application/json'
+        -d '{"url":"https://example.com","slug":"MxCMMF6"}'
+        && echo "slug MxCMMF6 pronto"
 
   frontend:
     build:
@@ -78,8 +137,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 512M
+          cpus: "0.1"
+          memory: 128M
 
 volumes:
   postgres_data:

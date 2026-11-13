@@ -35,9 +35,10 @@ function route<R>(handler: Handler<R>) {
   };
 }
 
-export function createServer(port: number | string) {
+export function createServer(port: number | string, options: { reusePort?: boolean } = {}) {
   return Bun.serve({
     port,
+    reusePort: options.reusePort,
     routes: {
       '/': route(() => new Response(AppController.getHello())),
       '/links': {

@@ -8,7 +8,7 @@ import { CreateLinkDto } from './dto/create-link.dto.js';
 import { QueryLinksDto, LinkSortField, SortOrder } from './dto/query-links.dto.js';
 import { LinkResponseDto, toLinkResponse } from './dto/link-response.dto.js';
 import { Link, LinkRow, toLink } from './link.js';
-import { LINK_BUFFER_KEY, REDIS_LINK_KEY, REDIS_LINK_DETAIL_KEY, REDIS_CLICK_COUNT_KEY, LINKS_LIST_CACHE_PREFIX } from '../_core/constants.js';
+import { LINK_BUFFER_KEY, REDIS_LINK_KEY, REDIS_LINK_DETAIL_KEY, REDIS_CLICK_COUNT_KEY, LINKS_LIST_CACHE_PREFIX, LINKS_LIST_VERSION_KEY } from '../_core/constants.js';
 
 const sql = PostgresService.sql;
 
@@ -139,7 +139,7 @@ export namespace LinksService {
     };
 
     await RedisService.set(REDIS_LINK_KEY(slug), linkData, 3600);
-    await RedisService.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await RedisService.incrby(LINKS_LIST_VERSION_KEY, 1);
 
     const bufferedLink: BufferedLink = {
       slug,
@@ -166,7 +166,8 @@ export namespace LinksService {
   export async function findAll(query: QueryLinksDto) {
     const { page, pageSize, q, sortField, sortOrder } = query;
 
-    const cacheKey = `${LINKS_LIST_CACHE_PREFIX}${page}:${pageSize}:${q ?? ''}:${sortField}:${sortOrder}`;
+    const version = await RedisService.getCounter(LINKS_LIST_VERSION_KEY);
+    const cacheKey = `${LINKS_LIST_CACHE_PREFIX}${version}:${page}:${pageSize}:${q ?? ''}:${sortField}:${sortOrder}`;
     const cached = await RedisService.get<any>(cacheKey);
     if (cached) return cached;
 
@@ -269,7 +270,7 @@ export namespace LinksService {
     const updated = await updateWithFlushRetry(slug, true);
 
     await RedisService.set(REDIS_LINK_KEY(slug), stripId(updated), 3600);
-    await RedisService.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await RedisService.incrby(LINKS_LIST_VERSION_KEY, 1);
     await RedisService.del(REDIS_LINK_DETAIL_KEY(slug));
     localCache.delete(slug);
 
@@ -279,7 +280,7 @@ export namespace LinksService {
   // Invalida L1 e L2 de um slug; público para outros services (ex: RedirectService) usarem.
   export async function invalidate(slug: string): Promise<void> {
     await RedisService.del(REDIS_LINK_KEY(slug));
-    await RedisService.delByPattern(`${LINKS_LIST_CACHE_PREFIX}*`);
+    await RedisService.incrby(LINKS_LIST_VERSION_KEY, 1);
     await RedisService.del(REDIS_LINK_DETAIL_KEY(slug));
     localCache.delete(slug);
   }

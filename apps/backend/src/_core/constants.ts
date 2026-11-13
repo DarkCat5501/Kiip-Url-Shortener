@@ -12,3 +12,7 @@ export const REDIS_CLICK_COUNT_KEY = (slug: string) => `c:${slug}`;
 export const LINK_BUFFER_KEY = 'b:links';
 export const ACCESS_LOG_BUFFER_KEY = 'b:acc_logs';
 export const LINKS_LIST_CACHE_PREFIX = 'll:';
+
+// Versão das listagens em cache: invalidar = incrementar (O(1)); as chaves da
+// versão anterior expiram sozinhas pelo TTL, sem varrer o keyspace.
+export const LINKS_LIST_VERSION_KEY = 'llv';

@@ -70,24 +70,20 @@ async function createLink(index: number): Promise<CreateResult> {
   }
 }
 
-// Loop de criação — tenta manter a taxa desejada por segundo
+// Loop de criação — dispara CREATE_RATE links por segundo, em ticks de 100ms
 async function creationLoop() {
+  const TICK_MS = 100;
+  const perTick = Math.max(1, Math.round((CREATE_RATE * TICK_MS) / 1000));
   let index = 0;
 
   while (creating) {
-    // Disparar batch grande de criação (fire and forget)
-    const batchSize = Math.min(CREATE_RATE, 500); // batches de até 500
-    const promises: Promise<CreateResult>[] = [];
+    const start = performance.now();
 
-    for (let i = 0; i < batchSize && creating; i++) {
-      promises.push(createLink(index++));
+    for (let i = 0; i < perTick && creating; i++) {
+      createLink(index++).catch(() => {});
     }
 
-    // Não aguardar — fire and forget
-    promises.forEach(p => p.catch(() => {}));
-
-    // Pequena pausa para não travar o event loop
-    await Bun.sleep(1);
+    await Bun.sleep(Math.max(0, TICK_MS - (performance.now() - start)));
   }
 }
 

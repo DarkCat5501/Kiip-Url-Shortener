@@ -138,7 +138,7 @@ async function runMultiSlugStressTest() {
   console.log('');
   console.log(`Slug alvo (/${TARGET_SLUG}):`);
   console.log(`Requests:     ${targetResult.requests.total.toLocaleString()}`);
-  console.log(`Duração:      ${(targetResult.duration / 1000).toFixed(1)}s`);
+  console.log(`Duração:      ${targetResult.duration.toFixed(1)}s`);
   console.log(`Throughput:   ${(targetResult.throughput.total / 1024 / 1024).toFixed(2)} MB/s`);
   console.log(`Req/s:        ${targetResult.requests.average.toLocaleString()}`);
   console.log(`Latency p50:  ${targetResult.latency.p50}ms`);
