@@ -96,6 +96,26 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this.client.lpush(key, ...values);
   }
 
+  // Um único round-trip para o lote: empilha os logs e soma os deltas dos
+  // contadores pendentes. Retorna o tamanho do buffer após o push.
+  async pushBatch(
+    listKey: string,
+    values: string[],
+    counterDeltas: Map<string, number>,
+    counterTtlSeconds: number,
+  ): Promise<number> {
+    const pipeline = this.client.pipeline().lpush(listKey, ...values);
+    for (const [key, delta] of counterDeltas) {
+      pipeline.incrby(key, delta).expire(key, counterTtlSeconds);
+    }
+
+    const results = await pipeline.exec();
+    for (const [err] of results!) {
+      if (err) throw err;
+    }
+    return results![0][1] as number;
+  }
+
   async lrange(key: string, start: number, stop: number): Promise<string[]> {
     return this.client.lrange(key, start, stop);
   }
